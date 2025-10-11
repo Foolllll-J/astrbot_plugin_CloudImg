@@ -2,7 +2,7 @@
     "base_url": {
         "description": "图床网址",
         "type": "string",
-        "hint": "填写获取随机图片的图床网址，无需//结尾斜杠",
+        "hint": "填写获取随机图片的图床网址，无需结尾斜杠",
         "default": "",
         "obvious_hint": true
     }
