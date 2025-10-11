@@ -1,24 +1,46 @@
+from astrbot.api.message_components import *
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import aiohttp
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+@register("astrbot_plugin_CloudImg", "Foolllll", "从图床获取随机图片。使用 /img 获取一张随机图片。", "1.0", "https://github.com/Foolllll/astrbot_plugin_CloudImg")
+class CloudImgPlugin(Star):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
+        self.config = config
+        self.base_url = config.get("base_url", "")
+        self.random_path_suffix = "/random?form=text" 
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-    
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
-
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+    @filter.command("img")
+    async def get_image(self, event: AstrMessageEvent):
+        
+        api_request_url = f"{self.base_url}{self.random_path_suffix}"
+        
+        if not self.base_url:
+            yield event.plain_result("\n请先在配置文件中设置图床的基础地址 (base_url)")
+            return
+            
+        # 创建一个不验证SSL的连接上下文
+        ssl_context = aiohttp.TCPConnector(verify_ssl=False)
+        async with aiohttp.ClientSession(connector=ssl_context) as session:
+            try:
+                async with session.get(api_request_url) as response:
+                    # 检查 HTTP 状态码
+                    if response.status != 200:
+                        yield event.plain_result(f"\nAPI请求失败，状态码: {response.status}")
+                        return
+                        
+                    relative_image_path = await response.text()
+                    relative_image_path = relative_image_path.strip()
+                    
+                    image_url = f"{self.base_url}{relative_image_path}"                  
+                    
+                    # 构建消息链
+                    chain = [
+                        Image.fromURL(image_url)
+                    ]
+                    
+                    yield event.chain_result(chain)
+                    
+            except Exception as e:
+                yield event.plain_result(f"\n请求图床失败: {str(e)}。请检查 base_url 是否正确。")
