@@ -2,8 +2,26 @@
     "base_url": {
         "description": "图床网址",
         "type": "string",
-        "hint": "填写获取随机图片的图床网址，无需结尾斜杠",
+        "hint": "填写图床网址，用于获取随机图片和上传图片，无需结尾斜杠",
         "default": "",
         "obvious_hint": true
+    },
+    "auth_code": {
+        "description": "上传认证码（可选）",
+        "type": "string",
+        "hint": "用于上传API的认证码（可选）",
+        "default": ""
+    },
+    "show_upload_link": {
+        "description": "上传成功时显示链接",
+        "type": "bool",
+        "hint": "上传成功时是否在消息中显示返回的图片链接",
+        "default": true
+    },
+    "upload_admin_only": {
+        "description": "上传功能仅管理员可用",
+        "type": "bool",
+        "hint": "是否仅允许管理员使用上传功能",
+        "default": true
     }
 }
