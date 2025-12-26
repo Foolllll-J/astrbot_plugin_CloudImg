@@ -6,6 +6,7 @@ import aiohttp
 import os
 import json
 import re
+import string
 from urllib.parse import urlparse
 from astrbot import logger
 from astrbot.core.message.components import Image, Plain, Reply
@@ -705,6 +706,11 @@ class CloudImgPlugin(Star):
             yield event.plain_result("请指定上传的文件夹名，格式：/上传 文件夹名")
             return
 
+        # 检测文件夹名是否包含英文标点
+        if any(char in string.punctuation for char in folder_name):
+            yield event.plain_result(f"文件夹名 {folder_name} 不允许包含英文标点")
+            return
+        
         forward_id, found_json_forward = await self._try_get_forward_id(event)
         logger.debug(f"/上传 检测结果: forward_id={forward_id}, found_json_forward={found_json_forward}")
         if forward_id:
