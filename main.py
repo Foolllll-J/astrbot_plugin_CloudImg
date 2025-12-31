@@ -904,12 +904,14 @@ class CloudImgPlugin(Star):
         """处理群组消息中的动态命令"""
         async for result in self._process_dynamic_command(event):
             yield result
+            event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def handle_dynamic_commands_private(self, event: AstrMessageEvent):
         """处理私聊消息中的动态命令"""
         async for result in self._process_dynamic_command(event):
             yield result
+            event.stop_event()
 
     async def _process_dynamic_command(self, event: AstrMessageEvent):
         """处理动态命令"""
