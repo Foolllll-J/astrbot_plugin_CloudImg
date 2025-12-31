@@ -7,8 +7,10 @@ import os
 import json
 import re
 import string
+import random
 from urllib.parse import urlparse
 from astrbot import logger
+from astrbot.api.message_components import Video, Reply as ApiReply
 from astrbot.core.message.components import Image, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent as BaseAstrMessageEvent
 
@@ -62,6 +64,24 @@ class CloudImgPlugin(Star):
 
     # ==================== 核心功能方法 ====================
 
+    def _handle_response_error(self, status: int, response_text: str) -> str:
+        """处理 API 响应错误，记录日志并返回友好提示"""
+        error_map = {
+            400: "请求参数错误",
+            401: "身份验证失败，请检查 auth_code",
+            403: "权限不足，请检查 auth_code 是否正确",
+            404: "资源未找到，请检查文件夹名是否正确",
+            413: "文件体积超过限制",
+            500: "图床服务器内部错误",
+            502: "图床服务网关错误",
+            503: "图床服务不可用",
+            504: "图床服务网关超时"
+        }
+        
+        friendly_msg = error_map.get(status, f"未知错误 (HTTP {status})")
+        logger.error(f"API 请求失败: status={status}, response={response_text}")
+        return f"操作失败: {friendly_msg}"
+
     async def get_random_file_from_folder(self, folder_name: str = "", content_type: str = "image,video"):
         """获取指定文件夹中的随机文件（图片或视频）
 
@@ -83,7 +103,8 @@ class CloudImgPlugin(Star):
                 async with session.get(api_request_url) as response:
                     # 检查HTTP状态码
                     if response.status != 200:
-                        return f"\nAPI请求失败，状态码: {response.status}"
+                        response_text = await response.text()
+                        return self._handle_response_error(response.status, response_text)
 
                     relative_file_path = await response.text()
                     relative_file_path = relative_file_path.strip()
@@ -93,7 +114,6 @@ class CloudImgPlugin(Star):
                     # 根据文件扩展名判断是图片还是视频
                     if any(file_url.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']):
                         # 视频文件
-                        from astrbot.api.message_components import Video
                         chain = [
                             Video.fromURL(file_url)
                         ]
@@ -106,7 +126,8 @@ class CloudImgPlugin(Star):
                     return chain
 
             except Exception as e:
-                return f"\n请求图床失败: {str(e)}。请检查 base_url 和文件夹名是否正确。"
+                logger.error(f"请求图床异常: {e}")
+                return "\n请求图床失败。请检查网络连接、base_url 和文件夹名是否正确。"
 
     async def download_image(self, url: str) -> bytes | None:
         """下载图片并返回字节数据"""
@@ -130,7 +151,7 @@ class CloudImgPlugin(Star):
         messages = event.get_messages()
 
         for seg in messages:
-            if isinstance(seg, Reply):
+            if isinstance(seg, ApiReply):
                 if hasattr(seg, 'chain') and isinstance(seg.chain, list):
                     for reply_seg in seg.chain:
                         if isinstance(reply_seg, Image):
@@ -155,12 +176,11 @@ class CloudImgPlugin(Star):
 
     async def get_first_video_from_reply(self, event: BaseAstrMessageEvent) -> tuple[bytes | None, str | None]:
         """从引用消息中获取第一个视频并返回(字节数据, 原始文件名)。"""
-        from astrbot.api.message_components import Reply, Video
 
         messages = event.get_messages()
 
         for seg in messages:
-            if isinstance(seg, Reply):
+            if isinstance(seg, ApiReply):
                 if hasattr(seg, 'chain') and isinstance(seg.chain, list):
                     for item in seg.chain:
                         if isinstance(item, Video):
@@ -233,28 +253,31 @@ class CloudImgPlugin(Star):
                     response_text = await response.text()
 
                     if response.status != 200:
-                        return f"上传失败，状态码: {response.status}, 响应: {response_text}"
+                        return self._handle_response_error(response.status, response_text)
 
-                    import json
                     try:
-                        response_json = await response.json()
+                        response_json = json.loads(response_text) # Use json.loads since we already have response_text
 
                         if isinstance(response_json, list) and len(response_json) > 0:
                             src_path = response_json[0].get('src', '')
                             if src_path:
                                 return src_path
                             else:
-                                return f"上传成功但未找到链接，响应: {response_text}"
+                                logger.error(f"上传成功但未找到链接，响应: {response_text}")
+                                return "上传成功但未找到链接"
                         elif 'data' in response_json and isinstance(response_json['data'], list) and len(response_json['data']) > 0:
                             src_path = response_json['data'][0].get('src', '')
                             if src_path:
                                 return src_path
                             else:
-                                return f"上传成功但未找到链接，响应: {response_text}"
+                                logger.error(f"上传成功但未找到链接，响应: {response_text}")
+                                return "上传成功但未找到链接"
                         else:
-                            return f"上传响应格式错误，响应: {response_text}"
+                            logger.error(f"上传响应格式错误，响应: {response_text}")
+                            return "上传响应格式错误"
                     except json.JSONDecodeError:
-                        return f"上传响应不是有效的JSON格式，响应: {response_text}"
+                        logger.error(f"上传响应不是有效的JSON格式，响应: {response_text}")
+                        return "上传响应不是有效的JSON格式"
         except Exception as e:
             logger.error(f"文件上传失败: err={type(e).__name__}")
             return "文件上传失败"
@@ -380,7 +403,7 @@ class CloudImgPlugin(Star):
 
         reply_refs: list[dict] = []
         for seg in messages:
-            if isinstance(seg, Reply) and hasattr(seg, "chain") and isinstance(seg.chain, list):
+            if isinstance(seg, ApiReply) and hasattr(seg, "chain") and isinstance(seg.chain, list):
                 for inner in seg.chain:
                     if isinstance(inner, Image):
                         url = getattr(inner, "url", None)
@@ -502,7 +525,7 @@ class CloudImgPlugin(Star):
             return forward_id, found_json_forward
 
         for seg in event.get_messages():
-            if isinstance(seg, Reply) and hasattr(seg, "chain") and isinstance(seg.chain, list):
+            if isinstance(seg, ApiReply) and hasattr(seg, "chain") and isinstance(seg.chain, list):
                 for inner in seg.chain:
                     if inner.__class__.__name__ == "Forward" and hasattr(inner, "id"):
                         logger.debug(f"检测到合并转发(Reply.chain): forward_id={inner.id}")
@@ -852,7 +875,7 @@ class CloudImgPlugin(Star):
             return
 
         if not folder_name:
-            yield event.plain_result("参数错误！格式：/imglink 关键词 文件夹名 [内容类型]\n例如：/imglink 3cy 3cy 或 /imglink 3cy 3cy img\n内容类型可选: img(图片), vid(视频), 未指定则为全部\n\n不带参数使用 /imglink 可查看所有映射。")
+            yield event.plain_result("参数错误！格式：/imglink 关键词 文件夹名 [内容类型]\n例如：/imglink test test 或 /imglink test test,test2 img\n内容类型可选: img(图片), vid(视频), 未指定则为全部\n\n不带参数使用 /imglink 可查看所有映射。")
             return
 
         if content_type:
@@ -875,27 +898,74 @@ class CloudImgPlugin(Star):
         content_type_desc = {"image": "图片", "video": "视频", "image,video": "图片或视频"}
         desc = content_type_desc.get(final_content_type, "图片或视频")
 
-        yield event.plain_result(f"已将关键词 '{keyword}' 与文件夹 '{folder_name}' 关联（{desc}），现在发送 /{keyword} 即可获取该文件夹的随机{desc}。")
+        yield event.plain_result(f"已将关键词 '{keyword}' 与文件夹 '{folder_name}' 关联（{desc}），现在发送 /{keyword} 即可获取其中随机一个文件夹的随机{desc}。")
 
     @filter.command("imgunlink")
-    async def unlink_keyword(self, event: AstrMessageEvent, keyword: str = None):
-        """取消关键词关联"""
+    async def unlink_keyword(self, event: AstrMessageEvent, keyword: str = None, folders_to_remove: str = None):
+        """取消关键词关联或删除部分文件夹"""
         if not event.is_admin():
             yield event.plain_result("此指令仅限管理员使用")
             return
 
         if not keyword:
-            yield event.plain_result("参数错误！格式：/imgunlink 关键词\n例如：/imgunlink 3cy")
+            yield event.plain_result("参数错误！格式：/imgunlink 关键词 [文件夹名]\n例如：/imgunlink test 或 /imgunlink test 3cy,test1")
             return
 
         if keyword not in self.keyword_folder_map:
             yield event.plain_result(f"关键词 '{keyword}' 不存在映射。")
             return
 
-        del self.keyword_folder_map[keyword]
-        self.save_keyword_mappings()
+        if not folders_to_remove:
+            # 删除整个关键词映射
+            del self.keyword_folder_map[keyword]
+            self.save_keyword_mappings()
+            yield event.plain_result(f"已完全删除关键词 '{keyword}' 的所有映射。")
+            return
 
-        yield event.plain_result(f"已删除关键词 '{keyword}' 的映射。")
+        # 删除指定的文件夹
+        mapping = self.keyword_folder_map[keyword]
+        if isinstance(mapping, dict):
+            current_folders_str = mapping.get("folder", "")
+        else:
+            current_folders_str = mapping
+        
+        current_folders = [f.strip() for f in current_folders_str.replace('，', ',').split(',') if f.strip()]
+        remove_list = [f.strip() for f in folders_to_remove.replace('，', ',').split(',') if f.strip()]
+        
+        new_folders = []
+        removed_count = 0
+        not_found = []
+        
+        for f in current_folders:
+            if f in remove_list:
+                removed_count += 1
+            else:
+                new_folders.append(f)
+        
+        for f in remove_list:
+            if f not in current_folders:
+                not_found.append(f)
+
+        if removed_count == 0:
+            yield event.plain_result(f"关键词 '{keyword}' 的映射中未找到指定的文件夹: {', '.join(not_found)}")
+            return
+
+        if not new_folders:
+            # 如果删完了，直接删除关键词
+            del self.keyword_folder_map[keyword]
+            msg = f"已删除关键词 '{keyword}' 关联的所有文件夹，该关键词已失效。"
+        else:
+            new_folder_str = ",".join(new_folders)
+            if isinstance(mapping, dict):
+                mapping["folder"] = new_folder_str
+            else:
+                self.keyword_folder_map[keyword] = new_folder_str
+            msg = f"已从关键词 '{keyword}' 中删除 {removed_count} 个文件夹。当前关联：{new_folder_str}"
+            if not_found:
+                msg += f"\n注：未找到以下文件夹：{', '.join(not_found)}"
+
+        self.save_keyword_mappings()
+        yield event.plain_result(msg)
 
     # ==================== 动态命令处理 ====================
 
@@ -927,11 +997,19 @@ class CloudImgPlugin(Star):
             if keyword in self.keyword_folder_map:
                 mapping = self.keyword_folder_map[keyword]
                 if isinstance(mapping, dict):
-                    folder_name = mapping.get("folder", "")
+                    folder_name_raw = mapping.get("folder", "")
                     content_type = mapping.get("content_type", "image,video")
                 else:
-                    folder_name = mapping
+                    folder_name_raw = mapping
                     content_type = "image,video"
+
+                # 处理多文件夹随机逻辑
+                folders = [f.strip() for f in folder_name_raw.replace('，', ',').split(',') if f.strip()]
+                if not folders:
+                    return
+
+                folder_name = random.choice(folders)
+                logger.debug(f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}")
 
                 result = await self.get_random_file_from_folder(folder_name, content_type)
 
