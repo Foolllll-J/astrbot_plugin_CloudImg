@@ -6,6 +6,12 @@
         "default": "",
         "obvious_hint": true
     },
+    "upload_admin_only": {
+        "description": "上传功能仅管理员可用",
+        "type": "bool",
+        "hint": "是否仅允许管理员使用上传功能",
+        "default": true
+    },
     "auth_code": {
         "description": "上传认证码（可选）",
         "type": "string",
@@ -18,10 +24,10 @@
         "hint": "上传成功时是否在消息中显示返回的图片链接",
         "default": true
     },
-    "upload_admin_only": {
-        "description": "上传功能仅管理员可用",
+    "local_random_type": {
+        "description": "媒体类型本地随机",
         "type": "bool",
-        "hint": "是否仅允许管理员使用上传功能",
-        "default": true
+        "hint": "若开启且请求包含图片和视频，则在本地随机选取其中一种类型后再请求图床，用于平衡图片和视频出现概率。",
+        "default": false
     }
 }

@@ -15,17 +15,18 @@ from astrbot.core.message.components import Image, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent as BaseAstrMessageEvent
 
 
-@register("astrbot_plugin_CloudImg", "Foolllll", "获取随机媒体及上传图片/视频到CloudFlare图床。使用指令可获取随机媒体，使用 /上传 文件夹名 回复图片或视频消息进行上传。", "1.1", "https://github.com/Foolllll-J/astrbot_plugin_CloudImg")
+@register("astrbot_plugin_CloudImg", "Foolllll", "获取随机媒体及上传图片/视频到CloudFlare图床。使用指令可获取随机媒体，使用 /上传 文件夹名 回复图片或视频消息进行上传。", "1.3", "https://github.com/Foolllll-J/astrbot_plugin_CloudImg")
 class CloudImgPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         self.base_url = config.get("base_url", "")
         self.upload_api_url = self.base_url
+        self.upload_admin_only = config.get("upload_admin_only", True)
         self.auth_code = config.get("auth_code", "")
         self.random_path_suffix = "/random?form=text"
-        self.upload_admin_only = config.get("upload_admin_only", True)
         self.show_upload_link = config.get("show_upload_link", True)
+        self.local_random_type = config.get("local_random_type", False)
         self.plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_CloudImg")
 
         os.makedirs(self.plugin_data_dir, exist_ok=True)
@@ -91,6 +92,13 @@ class CloudImgPlugin(Star):
         """
         if not self.base_url:
             return "\n请先在配置文件中设置图床的基础地址 (base_url)"
+
+        # 如果开启了本地随机类型且请求包含多种类型
+        if self.local_random_type and "," in content_type:
+            types = [t.strip() for t in content_type.split(",") if t.strip()]
+            if len(types) > 1:
+                content_type = random.choice(types)
+                logger.debug(f"本地随机媒体类型: 选中 {content_type}")
 
         api_request_url = f"{self.base_url}/random?form=text&content={content_type}"
         if folder_name:
@@ -355,12 +363,7 @@ class CloudImgPlugin(Star):
         if spec is None:
             return list(range(1, total + 1)), None
 
-        if isinstance(spec, int):
-            spec = str(spec)
-        elif not isinstance(spec, str):
-            return None, "序号参数格式错误，应为 1, 1-3 或 1,3,5"
-
-        spec = spec.strip()
+        spec = str(spec).strip()
         if not spec:
             return list(range(1, total + 1)), None
 
@@ -504,8 +507,6 @@ class CloudImgPlugin(Star):
                 return found_id
 
             return deep_find(meta, 4)
-
-            return None
 
         reply_id = None
         message_list = getattr(getattr(event, "message_obj", None), "message", None)
