@@ -2,32 +2,54 @@
     "base_url": {
         "description": "图床网址",
         "type": "string",
-        "hint": "填写图床网址，用于获取随机图片和上传图片，无需结尾斜杠",
+        "hint": "填写图床网址，用于获取随机图片和上传图片，无需结尾斜杠。",
         "default": "",
         "obvious_hint": true
     },
     "upload_admin_only": {
-        "description": "上传功能仅管理员可用",
+        "description": "仅管理员可上传",
         "type": "bool",
-        "hint": "是否仅允许管理员使用上传功能",
+        "hint": "是否仅允许管理员使用上传功能。",
         "default": true
     },
     "auth_code": {
-        "description": "上传认证码（可选）",
+        "description": "上传认证码",
         "type": "string",
-        "hint": "用于上传API的认证码（可选）",
+        "hint": "可选，用于上传 API 的认证码。",
         "default": ""
     },
     "show_upload_link": {
-        "description": "上传成功时显示链接",
+        "description": "上传后显示链接",
         "type": "bool",
-        "hint": "上传成功时是否在消息中显示返回的图片链接",
+        "hint": "开启时，上传成功后会在消息中显示返回的图片链接。",
         "default": true
     },
     "local_random_type": {
         "description": "媒体类型本地随机",
         "type": "bool",
-        "hint": "若开启且请求包含图片和视频，则在本地随机选取其中一种类型后再请求图床，用于平衡图片和视频出现概率。",
+        "hint": "若开启且请求包含图片和视频，则在本地随机选取其中一种类型后再请求图床。",
         "default": false
+    },
+    "keyword_recent_media_limit": {
+        "description": "近期媒体去重窗口",
+        "type": "int",
+        "hint": "0 为关闭。N>0 时，每个关键词记录最近 N 次媒体 ID。",
+        "slider": {
+            "min": 0,
+            "max": 30,
+            "step": 1
+        },
+        "default": 0
+    },
+    "keyword_dedupe_retry_limit": {
+        "description": "去重重试上限",
+        "type": "int",
+        "hint": "当新随机结果命中近期 ID 时的额外重试次数。",
+        "slider": {
+            "min": 0,
+            "max": 10,
+            "step": 1
+        },
+        "default": 2
     }
 }

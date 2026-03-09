@@ -15,7 +15,6 @@ from astrbot.core.message.components import Image, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent as BaseAstrMessageEvent
 
 
-@register("astrbot_plugin_CloudImg", "Foolllll", "获取随机媒体及上传图片/视频到CloudFlare图床。使用指令可获取随机媒体，使用 /上传 文件夹名 回复图片或视频消息进行上传。", "1.3", "https://github.com/Foolllll-J/astrbot_plugin_CloudImg")
 class CloudImgPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -27,6 +26,18 @@ class CloudImgPlugin(Star):
         self.random_path_suffix = "/random?form=text"
         self.show_upload_link = config.get("show_upload_link", True)
         self.local_random_type = config.get("local_random_type", False)
+        self.keyword_recent_media_limit = self._clamp_config_int(
+            config.get("keyword_recent_media_limit", 0),
+            min_value=0,
+            max_value=10,
+            default=0,
+        )
+        self.keyword_dedupe_retry_limit = self._clamp_config_int(
+            config.get("keyword_dedupe_retry_limit", 2),
+            min_value=0,
+            max_value=10,
+            default=2,
+        )
         self.plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_CloudImg")
 
         os.makedirs(self.plugin_data_dir, exist_ok=True)
@@ -34,6 +45,7 @@ class CloudImgPlugin(Star):
         self.keyword_folder_map = {}
         self.mappings_file = os.path.join(self.plugin_data_dir, "keyword_mappings.json")
         self.load_keyword_mappings()
+        self.keyword_recent_media_ids: dict[str, list[str]] = {}
 
     # ==================== 配置文件管理 ====================
 
@@ -65,6 +77,148 @@ class CloudImgPlugin(Star):
 
     # ==================== 核心功能方法 ====================
 
+    def _clamp_config_int(self, value: object, min_value: int, max_value: int, default: int) -> int:
+        """Parse int config with hard bounds."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+
+        if parsed < min_value:
+            return min_value
+        if parsed > max_value:
+            return max_value
+        return parsed
+
+    def _extract_media_id(self, relative_file_path: str) -> str:
+        """Use normalized path as media ID for dedupe tracking."""
+        media_id = (relative_file_path or "").strip()
+        if not media_id:
+            return ""
+
+        media_id = media_id.split('?', 1)[0]
+        media_id = media_id.split('#', 1)[0]
+        return media_id.lstrip('/')
+
+    def _history_distance(self, history: list[str], media_id: str) -> int:
+        """Larger value means farther from most recent records."""
+        try:
+            index = history.index(media_id)
+        except ValueError:
+            return len(history) + 1
+
+        return len(history) - index
+
+    def _remember_keyword_media_id(self, keyword: str, media_id: str):
+        if self.keyword_recent_media_limit <= 0:
+            return
+
+        media_id = (media_id or "").strip()
+        if not media_id:
+            return
+
+        history = self.keyword_recent_media_ids.get(keyword, [])
+        history.append(media_id)
+        if len(history) > self.keyword_recent_media_limit:
+            history = history[-self.keyword_recent_media_limit:]
+
+        self.keyword_recent_media_ids[keyword] = history
+
+    def _build_random_media_chain(self, file_url: str) -> list:
+        parsed_path = urlparse(file_url).path.lower()
+        video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm')
+        if any(parsed_path.endswith(ext) for ext in video_exts):
+            return [Video.fromURL(file_url)]
+        return [Image.fromURL(file_url)]
+
+    async def _fetch_random_media_entry(self, folder_name: str = "", content_type: str = "image,video"):
+        if not self.base_url:
+            return "请先配置 base_url。"
+
+        final_content_type = content_type
+        if self.local_random_type and "," in final_content_type:
+            types = [t.strip() for t in final_content_type.split(",") if t.strip()]
+            if len(types) > 1:
+                final_content_type = random.choice(types)
+                logger.debug(f"本地随机媒体类型：{final_content_type}")
+
+        api_request_url = f"{self.base_url}/random?form=text&content={final_content_type}"
+        if folder_name:
+            api_request_url += f"&dir={folder_name}"
+
+        ssl_context = aiohttp.TCPConnector(verify_ssl=False)
+        async with aiohttp.ClientSession(connector=ssl_context) as session:
+            try:
+                async with session.get(api_request_url) as response:
+                    if response.status != 200:
+                        response_text = await response.text()
+                        return self._handle_response_error(response.status, response_text)
+
+                    relative_file_path = (await response.text()).strip()
+                    if not relative_file_path:
+                        logger.error("Random API returned an empty path")
+                        return "请求失败：图床未返回媒体路径。"
+
+                    file_url = f"{self.base_url}{relative_file_path}"
+                    return {
+                        "chain": self._build_random_media_chain(file_url),
+                        "media_id": self._extract_media_id(relative_file_path),
+                        "file_url": file_url,
+                        "relative_file_path": relative_file_path,
+                    }
+
+            except Exception as e:
+                logger.error(f"请求随机媒体失败: {e}")
+                return "请求失败，请检查网络、base_url 与文件夹名。"
+
+    async def get_random_file_from_keyword(self, keyword: str, folder_name: str = "", content_type: str = "image,video"):
+        if self.keyword_recent_media_limit <= 0:
+            result = await self._fetch_random_media_entry(folder_name, content_type)
+            if isinstance(result, dict):
+                return result["chain"]
+            return result
+
+        history = self.keyword_recent_media_ids.get(keyword, [])
+        dedupe_enabled = len(history) >= self.keyword_recent_media_limit
+        max_attempts = self.keyword_dedupe_retry_limit + 1 if dedupe_enabled else 1
+
+        best_fallback = None
+        best_distance = -1
+        latest_result = None
+
+        for attempt in range(max_attempts):
+            result = await self._fetch_random_media_entry(folder_name, content_type)
+            if not isinstance(result, dict):
+                return result
+
+            latest_result = result
+            media_id = result.get("media_id", "")
+
+            if not dedupe_enabled or not media_id or media_id not in history:
+                self._remember_keyword_media_id(keyword, media_id)
+                return result["chain"]
+
+            distance = self._history_distance(history, media_id)
+            if distance > best_distance:
+                best_distance = distance
+                best_fallback = result
+
+            if attempt < max_attempts - 1:
+                logger.debug(
+                    f"/{keyword} 命中近期媒体 ID，重试 {attempt + 1}/{self.keyword_dedupe_retry_limit}"
+                )
+
+        selected = best_fallback or latest_result
+        if isinstance(selected, dict):
+            selected_id = selected.get("media_id", "")
+            self._remember_keyword_media_id(keyword, selected_id)
+            logger.debug(
+                f"/{keyword} 达到重试上限，回退媒体 ID：{selected_id or '<empty>'}"
+            )
+            return selected["chain"]
+
+        return "请求失败：未获取到可用媒体。"
+
     def _handle_response_error(self, status: int, response_text: str) -> str:
         """处理 API 响应错误，记录日志并返回友好提示"""
         error_map = {
@@ -84,58 +238,11 @@ class CloudImgPlugin(Star):
         return f"操作失败: {friendly_msg}"
 
     async def get_random_file_from_folder(self, folder_name: str = "", content_type: str = "image,video"):
-        """获取指定文件夹中的随机文件（图片或视频）
-
-        Args:
-            folder_name: 文件夹名称，空字符串表示根目录
-            content_type: 内容类型，可选 "image", "video", "image,video"
-        """
-        if not self.base_url:
-            return "\n请先在配置文件中设置图床的基础地址 (base_url)"
-
-        # 如果开启了本地随机类型且请求包含多种类型
-        if self.local_random_type and "," in content_type:
-            types = [t.strip() for t in content_type.split(",") if t.strip()]
-            if len(types) > 1:
-                content_type = random.choice(types)
-                logger.debug(f"本地随机媒体类型: 选中 {content_type}")
-
-        api_request_url = f"{self.base_url}/random?form=text&content={content_type}"
-        if folder_name:
-            api_request_url += f"&dir={folder_name}"
-
-        # 创建不验证SSL的连接上下文
-        ssl_context = aiohttp.TCPConnector(verify_ssl=False)
-        async with aiohttp.ClientSession(connector=ssl_context) as session:
-            try:
-                async with session.get(api_request_url) as response:
-                    # 检查HTTP状态码
-                    if response.status != 200:
-                        response_text = await response.text()
-                        return self._handle_response_error(response.status, response_text)
-
-                    relative_file_path = await response.text()
-                    relative_file_path = relative_file_path.strip()
-
-                    file_url = f"{self.base_url}{relative_file_path}"
-
-                    # 根据文件扩展名判断是图片还是视频
-                    if any(file_url.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']):
-                        # 视频文件
-                        chain = [
-                            Video.fromURL(file_url)
-                        ]
-                    else:
-                        # 图片文件
-                        chain = [
-                            Image.fromURL(file_url)
-                        ]
-
-                    return chain
-
-            except Exception as e:
-                logger.error(f"请求图床异常: {e}")
-                return "\n请求图床失败。请检查网络连接、base_url 和文件夹名是否正确。"
+        """Get one random image/video from the target folder."""
+        result = await self._fetch_random_media_entry(folder_name, content_type)
+        if isinstance(result, dict):
+            return result["chain"]
+        return result
 
     async def download_image(self, url: str) -> bytes | None:
         """下载图片并返回字节数据"""
@@ -717,7 +824,7 @@ class CloudImgPlugin(Star):
 
     @filter.command("上传", alias={"upload"})
     async def upload_image(self, event: AstrMessageEvent, folder_name: str = None, index_spec: str = None):
-        """上传图片到CloudFlare ImgBed"""
+        """上传媒体到CloudFlare ImgBed"""
         msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
         logger.info(f"/上传: folder={folder_name}, index_spec={index_spec}")
         logger.debug(f"/上传 message_id={msg_id}")
@@ -919,6 +1026,7 @@ class CloudImgPlugin(Star):
         if not folders_to_remove:
             # 删除整个关键词映射
             del self.keyword_folder_map[keyword]
+            self.keyword_recent_media_ids.pop(keyword, None)
             self.save_keyword_mappings()
             yield event.plain_result(f"已完全删除关键词 '{keyword}' 的所有映射。")
             return
@@ -954,6 +1062,7 @@ class CloudImgPlugin(Star):
         if not new_folders:
             # 如果删完了，直接删除关键词
             del self.keyword_folder_map[keyword]
+            self.keyword_recent_media_ids.pop(keyword, None)
             msg = f"已删除关键词 '{keyword}' 关联的所有文件夹，该关键词已失效。"
         else:
             new_folder_str = ",".join(new_folders)
@@ -969,17 +1078,9 @@ class CloudImgPlugin(Star):
         yield event.plain_result(msg)
 
     # ==================== 动态命令处理 ====================
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def handle_dynamic_commands_group(self, event: AstrMessageEvent):
-        """处理群组消息中的动态命令"""
-        async for result in self._process_dynamic_command(event):
-            yield result
-            event.stop_event()
-
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    async def handle_dynamic_commands_private(self, event: AstrMessageEvent):
-        """处理私聊消息中的动态命令"""
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_dynamic_commands(self, event: AstrMessageEvent):
+        """处理群聊和私聊消息中的动态命令"""
         async for result in self._process_dynamic_command(event):
             yield result
             event.stop_event()
@@ -1012,7 +1113,7 @@ class CloudImgPlugin(Star):
                 folder_name = random.choice(folders)
                 logger.debug(f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}")
 
-                result = await self.get_random_file_from_folder(folder_name, content_type)
+                result = await self.get_random_file_from_keyword(keyword, folder_name, content_type)
 
                 if isinstance(result, list):
                     yield event.chain_result(result)
