@@ -1093,8 +1093,55 @@ class CloudImgPlugin(Star):
                 message_text = seg.text.strip()
                 break
 
-        if message_text.startswith('/') and len(message_text) > 1:
-            keyword = message_text[1:]
+        if not message_text:
+            return
+
+        is_wake = bool(
+            getattr(event, "is_at_or_wake_command", False)
+            or getattr(event, "is_wake", False)
+        )
+        if not is_wake:
+            return
+
+        try:
+            cfg = self.context.get_config(event.unified_msg_origin)
+        except Exception:
+            cfg = self.context.get_config()
+        wake_prefixes = cfg.get("wake_prefix", [])
+        if isinstance(wake_prefixes, str):
+            wake_prefixes = [wake_prefixes]
+        wake_prefixes = [p for p in wake_prefixes if isinstance(p, str) and p]
+
+        matched_prefix = None
+        for prefix in wake_prefixes:
+            if message_text.startswith(prefix):
+                if matched_prefix is None or len(prefix) > len(matched_prefix):
+                    matched_prefix = prefix
+
+        if matched_prefix is None:
+            has_at_or_reply_self = False
+            try:
+                for seg in event.get_messages():
+                    if isinstance(seg, At) and str(seg.qq) == str(event.get_self_id()):
+                        has_at_or_reply_self = True
+                        break
+                    if isinstance(seg, ApiReply) and str(seg.sender_id) == str(event.get_self_id()):
+                        has_at_or_reply_self = True
+                        break
+            except Exception:
+                has_at_or_reply_self = False
+
+            if not has_at_or_reply_self:
+                return
+
+        if matched_prefix and len(message_text) > len(matched_prefix):
+            keyword = message_text[len(matched_prefix) :].strip()
+        else:
+            keyword = message_text.strip()
+
+        if keyword:
+            if matched_prefix is None and (" " in keyword or "\t" in keyword):
+                return
 
             if keyword in self.keyword_folder_map:
                 mapping = self.keyword_folder_map[keyword]
