@@ -1135,9 +1135,21 @@ class CloudImgPlugin(Star):
                 return
 
         if matched_prefix and len(message_text) > len(matched_prefix):
-            keyword = message_text[len(matched_prefix) :].strip()
+            command_body = message_text[len(matched_prefix) :].strip()
         else:
-            keyword = message_text.strip()
+            command_body = message_text.strip()
+
+        keyword = command_body
+        force_content_type: str | None = None
+        parts = [p for p in command_body.split() if p]
+        if parts:
+            keyword = parts[0]
+            if len(parts) >= 2:
+                type_arg = parts[1].lower()
+                if type_arg in ["v", "vid", "video"]:
+                    force_content_type = "video"
+                elif type_arg in ["i", "img", "image"]:
+                    force_content_type = "image"
 
         if keyword:
             if matched_prefix is None and (" " in keyword or "\t" in keyword):
@@ -1152,13 +1164,18 @@ class CloudImgPlugin(Star):
                     folder_name_raw = mapping
                     content_type = "image,video"
 
+                if force_content_type:
+                    content_type = force_content_type
+
                 # 处理多文件夹随机逻辑
                 folders = [f.strip() for f in folder_name_raw.replace('，', ',').split(',') if f.strip()]
                 if not folders:
                     return
 
                 folder_name = random.choice(folders)
-                logger.debug(f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}")
+                logger.debug(
+                    f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}, content_type={content_type}"
+                )
 
                 result = await self.get_random_file_from_keyword(keyword, folder_name, content_type)
 
