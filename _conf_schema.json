@@ -6,6 +6,12 @@
         "default": "",
         "obvious_hint": true
     },
+    "public_base_url": {
+        "description": "公网图床网址",
+        "type": "string",
+        "hint": "可选，仅用于上传成功后显示链接的拼接前缀。当图床网址使用内网地址时，可在此填写对外可访问的 URL，无需结尾斜杠。",
+        "default": ""
+    },
     "upload_admin_only": {
         "description": "仅管理员可上传",
         "type": "bool",

@@ -21,6 +21,7 @@ class CloudImgPlugin(Star):
         self.config = config
         self.base_url = config.get("base_url", "")
         self.upload_api_url = self.base_url
+        self.public_base_url = self._normalize_base_url(config.get("public_base_url", ""))
         self.upload_admin_only = config.get("upload_admin_only", True)
         self.auth_code = config.get("auth_code", "")
         self.random_path_suffix = "/random?form=text"
@@ -89,6 +90,37 @@ class CloudImgPlugin(Star):
         if parsed > max_value:
             return max_value
         return parsed
+
+    def _normalize_base_url(self, value: object) -> str:
+        return str(value or "").strip().rstrip("/")
+
+    def _build_url_from_base(self, base_url: str, path: str) -> str:
+        normalized_base = self._normalize_base_url(base_url)
+        normalized_path = (path or "").strip()
+        if not normalized_path:
+            return ""
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        return f"{normalized_base}{normalized_path}" if normalized_base else normalized_path
+
+    def _build_upload_display_url(self, src_path: str) -> str:
+        src_value = (src_path or "").strip()
+        if not src_value:
+            return ""
+
+        parsed = urlparse(src_value)
+        if parsed.scheme and parsed.netloc:
+            if self.public_base_url:
+                path_and_suffix = parsed.path or "/"
+                if parsed.query:
+                    path_and_suffix = f"{path_and_suffix}?{parsed.query}"
+                if parsed.fragment:
+                    path_and_suffix = f"{path_and_suffix}#{parsed.fragment}"
+                return self._build_url_from_base(self.public_base_url, path_and_suffix)
+            return src_value
+
+        display_base_url = self.public_base_url or self.base_url
+        return self._build_url_from_base(display_base_url, src_value)
 
     def _extract_media_id(self, relative_file_path: str) -> str:
         """Use normalized path as media ID for dedupe tracking."""
@@ -376,14 +408,14 @@ class CloudImgPlugin(Star):
                         if isinstance(response_json, list) and len(response_json) > 0:
                             src_path = response_json[0].get('src', '')
                             if src_path:
-                                return src_path
+                                return self._build_upload_display_url(src_path)
                             else:
                                 logger.error(f"上传成功但未找到链接，响应: {response_text}")
                                 return "上传成功但未找到链接"
                         elif 'data' in response_json and isinstance(response_json['data'], list) and len(response_json['data']) > 0:
                             src_path = response_json['data'][0].get('src', '')
                             if src_path:
-                                return src_path
+                                return self._build_upload_display_url(src_path)
                             else:
                                 logger.error(f"上传成功但未找到链接，响应: {response_text}")
                                 return "上传成功但未找到链接"
