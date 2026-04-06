@@ -516,22 +516,42 @@ class CloudImgPlugin(Star):
             if not part:
                 continue
             
-            # 处理单数字
-            if re.fullmatch(r"\d+", part):
+            # 1. 处理单数字 (支持负数，如 -1, -2)
+            if re.fullmatch(r"-?\d+", part):
                 idx = int(part)
-                if idx < 1 or idx > total:
-                    return None, f"序号 {idx} 超出范围：当前共有 {total} 个{label}"
-                indices.add(idx)
-            # 处理范围
-            elif m := re.fullmatch(r"(\d+)-(\d+)", part):
-                start = int(m.group(1))
-                end = int(m.group(2))
-                if start < 1 or end < 1 or start > end:
-                    return None, f"序号范围 {part} 格式错误，应为 1-3 这种格式"
-                if end > total:
-                    return None, f"序号 {end} 超出范围：当前共有 {total} 个{label}"
-                for i in range(start, end + 1):
-                    indices.add(i)
+                if idx == 0:
+                    return None, "序号不能为 0"
+                
+                # 转换负数为正数索引
+                final_idx = idx if idx > 0 else total + idx + 1
+                
+                if final_idx < 1 or final_idx > total:
+                    return None, f"序号 {idx} (计算为 {final_idx}) 超出范围：当前共有 {total} 个{label}"
+                indices.add(final_idx)
+
+            # 2. 处理范围 (如 1-3 或 -3--1)
+            elif m := re.fullmatch(r"(-?\d+)-(-?\d+)", part):
+                try:
+                    start_val = int(m.group(1))
+                    end_val = int(m.group(2))
+                    
+                    if start_val == 0 or end_val == 0:
+                        return None, "序号范围中不能包含 0"
+
+                    # 转换逻辑
+                    start_idx = start_val if start_val > 0 else total + start_val + 1
+                    end_idx = end_val if end_val > 0 else total + end_val + 1
+
+                    if start_idx > end_idx:
+                        return None, f"序号范围 {part} 无效：起始位置大于结束位置"
+                    
+                    if start_idx < 1 or end_idx > total:
+                        return None, f"序号范围 {part} 超出边界 (1-{total})"
+
+                    for i in range(start_idx, end_idx + 1):
+                        indices.add(i)
+                except Exception:
+                    return None, f"序号范围 {part} 解析错误"
             else:
                 return None, f"无法解析序号参数: {part}"
 
