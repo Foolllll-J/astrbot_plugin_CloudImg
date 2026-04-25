@@ -30,7 +30,7 @@ class CloudImgPlugin(Star):
         self.keyword_recent_media_limit = self._clamp_config_int(
             config.get("keyword_recent_media_limit", 0),
             min_value=0,
-            max_value=10,
+            max_value=None,
             default=0,
         )
         self.keyword_dedupe_retry_limit = self._clamp_config_int(
@@ -44,9 +44,14 @@ class CloudImgPlugin(Star):
         os.makedirs(self.plugin_data_dir, exist_ok=True)
 
         self.keyword_folder_map = {}
+        self.config_keyword_map: dict[str, dict] = {}
+        self.effective_keyword_map: dict[str, dict] = {}
         self.mappings_file = os.path.join(self.plugin_data_dir, "keyword_mappings.json")
         self.load_keyword_mappings()
+        self.load_config_keyword_templates()
+        self.refresh_effective_keyword_map()
         self.keyword_recent_media_ids: dict[str, list[str]] = {}
+        self.keyword_recent_media_kv_key = "keyword_recent_media_ids"
 
     # ==================== 配置文件管理 ====================
 
@@ -76,9 +81,109 @@ class CloudImgPlugin(Star):
         except Exception as e:
             logger.error(f"保存关键词映射失败: {e}")
 
+    def _normalize_folder_names(self, folder_value: object) -> list[str]:
+        if isinstance(folder_value, list):
+            candidates = folder_value
+        else:
+            candidates = str(folder_value or "").replace("，", ",").split(",")
+
+        folders: list[str] = []
+        for item in candidates:
+            folder = str(item or "").strip()
+            if folder and folder not in folders:
+                folders.append(folder)
+        return folders
+
+    def _normalize_content_type(self, content_type: object) -> str:
+        normalized = str(content_type or "").strip().lower()
+        if normalized in {"image", "video", "image,video"}:
+            return normalized
+        return "image,video"
+
+    def _build_mapping_entry(
+        self,
+        folders: list[str],
+        content_type: object = "image,video",
+        source: str | None = None,
+    ) -> dict | None:
+        normalized_folders = self._normalize_folder_names(folders)
+        if not normalized_folders:
+            return None
+
+        mapping = {
+            "folder": ",".join(normalized_folders),
+            "content_type": self._normalize_content_type(content_type),
+        }
+        if source:
+            mapping["source"] = source
+        return mapping
+
+    def load_config_keyword_templates(self):
+        self.config_keyword_map = {}
+        templates = self.config.get("keyword_templates", [])
+        if not isinstance(templates, list):
+            return
+
+        for item in templates:
+            if not isinstance(item, dict):
+                continue
+
+            keywords = item.get("keywords", [])
+            folders = item.get("folders", [])
+            if not isinstance(keywords, list):
+                continue
+
+            mapping_entry = self._build_mapping_entry(
+                folders=folders,
+                content_type=item.get("content_type", "image,video"),
+                source="template",
+            )
+            if not mapping_entry:
+                continue
+
+            for keyword in keywords:
+                normalized_keyword = str(keyword or "").strip()
+                if not normalized_keyword:
+                    continue
+                self.config_keyword_map[normalized_keyword] = dict(mapping_entry)
+
+    def refresh_effective_keyword_map(self):
+        effective_map: dict[str, dict] = {
+            key: dict(value)
+            for key, value in self.config_keyword_map.items()
+            if isinstance(value, dict)
+        }
+
+        for key, value in self.keyword_folder_map.items():
+            if isinstance(value, str):
+                mapping_entry = self._build_mapping_entry(
+                    folders=value,
+                    content_type="image,video",
+                    source="runtime",
+                )
+            elif isinstance(value, dict):
+                mapping_entry = self._build_mapping_entry(
+                    folders=value.get("folder", ""),
+                    content_type=value.get("content_type", "image,video"),
+                    source="runtime",
+                )
+            else:
+                mapping_entry = None
+
+            if mapping_entry:
+                effective_map[key] = mapping_entry
+
+        self.effective_keyword_map = effective_map
+
     # ==================== 核心功能方法 ====================
 
-    def _clamp_config_int(self, value: object, min_value: int, max_value: int, default: int) -> int:
+    def _clamp_config_int(
+        self,
+        value: object,
+        min_value: int,
+        max_value: int | None,
+        default: int,
+    ) -> int:
         """Parse int config with hard bounds."""
         try:
             parsed = int(value)
@@ -87,9 +192,69 @@ class CloudImgPlugin(Star):
 
         if parsed < min_value:
             return min_value
-        if parsed > max_value:
+        if max_value is not None and parsed > max_value:
             return max_value
         return parsed
+
+    async def initialize(self):
+        await self._load_keyword_recent_media_ids()
+
+    async def _load_keyword_recent_media_ids(self):
+        self.keyword_recent_media_ids = {}
+        if self.keyword_recent_media_limit <= 0:
+            return
+
+        try:
+            stored = await self.get_kv_data(self.keyword_recent_media_kv_key, {})
+        except Exception as e:
+            logger.error(f"加载近期媒体去重缓存失败: {e}")
+            return
+
+        if not isinstance(stored, dict):
+            return
+
+        valid_keywords = set(self.effective_keyword_map.keys())
+        valid_keywords.add("__img__")
+        needs_persist = False
+
+        for keyword, history in stored.items():
+            if not isinstance(keyword, str) or not isinstance(history, list):
+                needs_persist = True
+                continue
+
+            if keyword not in valid_keywords:
+                needs_persist = True
+                continue
+
+            normalized_history = [
+                str(item).strip()
+                for item in history
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if self.keyword_recent_media_limit > 0:
+                trimmed_history = normalized_history[-self.keyword_recent_media_limit:]
+                if trimmed_history != normalized_history:
+                    needs_persist = True
+                normalized_history = trimmed_history
+            if normalized_history:
+                self.keyword_recent_media_ids[keyword] = normalized_history
+            elif history:
+                needs_persist = True
+
+        if needs_persist:
+            await self._persist_keyword_recent_media_ids()
+
+    async def _persist_keyword_recent_media_ids(self):
+        try:
+            if self.keyword_recent_media_limit <= 0:
+                await self.delete_kv_data(self.keyword_recent_media_kv_key)
+            else:
+                await self.put_kv_data(
+                    self.keyword_recent_media_kv_key,
+                    self.keyword_recent_media_ids,
+                )
+        except Exception as e:
+            logger.error(f"保存近期媒体去重缓存失败: {e}")
 
     def _normalize_base_url(self, value: object) -> str:
         return str(value or "").strip().rstrip("/")
@@ -141,7 +306,7 @@ class CloudImgPlugin(Star):
 
         return len(history) - index
 
-    def _remember_keyword_media_id(self, keyword: str, media_id: str):
+    async def _remember_keyword_media_id(self, keyword: str, media_id: str):
         if self.keyword_recent_media_limit <= 0:
             return
 
@@ -155,6 +320,7 @@ class CloudImgPlugin(Star):
             history = history[-self.keyword_recent_media_limit:]
 
         self.keyword_recent_media_ids[keyword] = history
+        await self._persist_keyword_recent_media_ids()
 
     def _build_random_media_chain(self, file_url: str) -> list:
         parsed_path = urlparse(file_url).path.lower()
@@ -211,7 +377,7 @@ class CloudImgPlugin(Star):
             return result
 
         history = self.keyword_recent_media_ids.get(keyword, [])
-        dedupe_enabled = len(history) >= self.keyword_recent_media_limit
+        dedupe_enabled = len(history) > 0
         max_attempts = self.keyword_dedupe_retry_limit + 1 if dedupe_enabled else 1
 
         best_fallback = None
@@ -227,7 +393,7 @@ class CloudImgPlugin(Star):
             media_id = result.get("media_id", "")
 
             if not dedupe_enabled or not media_id or media_id not in history:
-                self._remember_keyword_media_id(keyword, media_id)
+                await self._remember_keyword_media_id(keyword, media_id)
                 return result["chain"]
 
             distance = self._history_distance(history, media_id)
@@ -243,7 +409,7 @@ class CloudImgPlugin(Star):
         selected = best_fallback or latest_result
         if isinstance(selected, dict):
             selected_id = selected.get("media_id", "")
-            self._remember_keyword_media_id(keyword, selected_id)
+            await self._remember_keyword_media_id(keyword, selected_id)
             logger.debug(
                 f"/{keyword} 达到重试上限，回退媒体 ID：{selected_id or '<empty>'}"
             )
@@ -868,7 +1034,7 @@ class CloudImgPlugin(Star):
     @filter.command("img")
     async def get_image(self, event: AstrMessageEvent):
         """获取随机图片或视频"""
-        result = await self.get_random_file_from_folder("", "image,video")
+        result = await self.get_random_file_from_keyword("__img__", "", "image,video")
         if isinstance(result, list):
             yield event.chain_result(result)
         else:
@@ -1018,16 +1184,18 @@ class CloudImgPlugin(Star):
             return
 
         if not keyword:
-            if not self.keyword_folder_map:
+            if not self.effective_keyword_map:
                 yield event.plain_result("当前没有已设置的关键词映射。")
                 return
 
             result = "当前关键词映射列表：\n"
-            for key, mapping in self.keyword_folder_map.items():
+            for key, mapping in self.effective_keyword_map.items():
                 if isinstance(mapping, dict):
                     folder = mapping.get("folder", "")
                     ctype = mapping.get("content_type", "image,video")
-                    result += f"  /{key} -> {folder} ({ctype})\n"
+                    source = mapping.get("source", "runtime")
+                    source_text = "指令" if source == "runtime" else "模板"
+                    result += f"  /{key} -> {folder} ({ctype}) [{source_text}]\n"
                 else:
                     result += f"  /{key} -> {mapping}\n"
             result += "\n使用 /imglink 关键词 文件夹名 [内容类型] 来添加新映射。\n内容类型可选: img(图片), vid(视频), 未指定则为全部"
@@ -1054,6 +1222,7 @@ class CloudImgPlugin(Star):
             "content_type": final_content_type
         }
         self.save_keyword_mappings()
+        self.refresh_effective_keyword_map()
 
         content_type_desc = {"image": "图片", "video": "视频", "image,video": "图片或视频"}
         desc = content_type_desc.get(final_content_type, "图片或视频")
@@ -1072,15 +1241,24 @@ class CloudImgPlugin(Star):
             return
 
         if keyword not in self.keyword_folder_map:
-            yield event.plain_result(f"关键词 '{keyword}' 不存在映射。")
+            if keyword in self.config_keyword_map:
+                yield event.plain_result(f"关键词 '{keyword}' 来自模板配置，不能通过 /imgunlink 删除，请到插件配置中修改。")
+            else:
+                yield event.plain_result(f"关键词 '{keyword}' 不存在映射。")
             return
 
         if not folders_to_remove:
             # 删除整个关键词映射
             del self.keyword_folder_map[keyword]
-            self.keyword_recent_media_ids.pop(keyword, None)
             self.save_keyword_mappings()
-            yield event.plain_result(f"已完全删除关键词 '{keyword}' 的所有映射。")
+            self.refresh_effective_keyword_map()
+            if keyword not in self.effective_keyword_map:
+                self.keyword_recent_media_ids.pop(keyword, None)
+            await self._persist_keyword_recent_media_ids()
+            if keyword in self.config_keyword_map:
+                yield event.plain_result(f"已删除关键词 '{keyword}' 的指令映射，当前将回退为模板配置。")
+            else:
+                yield event.plain_result(f"已完全删除关键词 '{keyword}' 的所有映射。")
             return
 
         # 删除指定的文件夹
@@ -1114,19 +1292,26 @@ class CloudImgPlugin(Star):
         if not new_folders:
             # 如果删完了，直接删除关键词
             del self.keyword_folder_map[keyword]
-            self.keyword_recent_media_ids.pop(keyword, None)
-            msg = f"已删除关键词 '{keyword}' 关联的所有文件夹，该关键词已失效。"
+            self.refresh_effective_keyword_map()
+            if keyword not in self.effective_keyword_map:
+                self.keyword_recent_media_ids.pop(keyword, None)
+                msg = f"已删除关键词 '{keyword}' 关联的所有文件夹，该关键词已失效。"
+            else:
+                msg = f"已删除关键词 '{keyword}' 的指令映射，当前将回退为模板配置。"
         else:
             new_folder_str = ",".join(new_folders)
             if isinstance(mapping, dict):
                 mapping["folder"] = new_folder_str
             else:
                 self.keyword_folder_map[keyword] = new_folder_str
+            self.refresh_effective_keyword_map()
             msg = f"已从关键词 '{keyword}' 中删除 {removed_count} 个文件夹。当前关联：{new_folder_str}"
             if not_found:
                 msg += f"\n注：未找到以下文件夹：{', '.join(not_found)}"
 
         self.save_keyword_mappings()
+        if keyword not in self.effective_keyword_map:
+            await self._persist_keyword_recent_media_ids()
         yield event.plain_result(msg)
 
     # ==================== 动态命令处理 ====================
@@ -1207,8 +1392,8 @@ class CloudImgPlugin(Star):
             if matched_prefix is None and (" " in keyword or "\t" in keyword):
                 return
 
-            if keyword in self.keyword_folder_map:
-                mapping = self.keyword_folder_map[keyword]
+            if keyword in self.effective_keyword_map:
+                mapping = self.effective_keyword_map[keyword]
                 if isinstance(mapping, dict):
                     folder_name_raw = mapping.get("folder", "")
                     content_type = mapping.get("content_type", "image,video")
@@ -1238,4 +1423,5 @@ class CloudImgPlugin(Star):
 
     async def terminate(self):
         """插件销毁时的清理工作"""
+        await self._persist_keyword_recent_media_ids()
         logger.info("CF图床助手已卸载")
