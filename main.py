@@ -1333,13 +1333,11 @@ class CloudImgPlugin(Star):
         if not message_text:
             return
 
-        is_wake = bool(
-            getattr(event, "is_at_or_wake_command", False)
-            or getattr(event, "is_wake", False)
-        )
-        if not is_wake:
+        is_private = event.get_group_id() is None
+        if not is_private and not getattr(event, "is_at_or_wake_command", False) and not getattr(event, "is_wake", False):
             return
 
+        # 去除唤醒前缀（如有），提取命令内容
         try:
             cfg = self.context.get_config(event.unified_msg_origin)
         except Exception:
@@ -1347,79 +1345,51 @@ class CloudImgPlugin(Star):
         wake_prefixes = cfg.get("wake_prefix", [])
         if isinstance(wake_prefixes, str):
             wake_prefixes = [wake_prefixes]
-        wake_prefixes = [p for p in wake_prefixes if isinstance(p, str) and p]
-
-        matched_prefix = None
         for prefix in wake_prefixes:
-            if message_text.startswith(prefix):
-                if matched_prefix is None or len(prefix) > len(matched_prefix):
-                    matched_prefix = prefix
+            if isinstance(prefix, str) and prefix and message_text.startswith(prefix):
+                message_text = message_text[len(prefix):].strip()
+                break
 
-        if matched_prefix is None:
-            has_at_or_reply_self = False
-            try:
-                for seg in event.get_messages():
-                    if isinstance(seg, At) and str(seg.qq) == str(event.get_self_id()):
-                        has_at_or_reply_self = True
-                        break
-                    if isinstance(seg, ApiReply) and str(seg.sender_id) == str(event.get_self_id()):
-                        has_at_or_reply_self = True
-                        break
-            except Exception:
-                has_at_or_reply_self = False
+        parts = [p for p in message_text.split() if p]
+        if not parts:
+            return
 
-            if not has_at_or_reply_self:
-                return
-
-        if matched_prefix and len(message_text) > len(matched_prefix):
-            command_body = message_text[len(matched_prefix) :].strip()
-        else:
-            command_body = message_text.strip()
-
-        keyword = command_body
+        keyword = parts[0]
         force_content_type: str | None = None
-        parts = [p for p in command_body.split() if p]
-        if parts:
-            keyword = parts[0]
-            if len(parts) >= 2:
-                type_arg = parts[1].lower()
-                if type_arg in ["v", "vid", "video"]:
-                    force_content_type = "video"
-                elif type_arg in ["i", "img", "image"]:
-                    force_content_type = "image"
+        if len(parts) >= 2:
+            type_arg = parts[1].lower()
+            if type_arg in ["v", "vid", "video"]:
+                force_content_type = "video"
+            elif type_arg in ["i", "img", "image"]:
+                force_content_type = "image"
 
-        if keyword:
-            if matched_prefix is None and (" " in keyword or "\t" in keyword):
+        if keyword in self.effective_keyword_map:
+            mapping = self.effective_keyword_map[keyword]
+            if isinstance(mapping, dict):
+                folder_name_raw = mapping.get("folder", "")
+                content_type = mapping.get("content_type", "image,video")
+            else:
+                folder_name_raw = mapping
+                content_type = "image,video"
+
+            if force_content_type:
+                content_type = force_content_type
+
+            folders = [f.strip() for f in folder_name_raw.replace('，', ',').split(',') if f.strip()]
+            if not folders:
                 return
 
-            if keyword in self.effective_keyword_map:
-                mapping = self.effective_keyword_map[keyword]
-                if isinstance(mapping, dict):
-                    folder_name_raw = mapping.get("folder", "")
-                    content_type = mapping.get("content_type", "image,video")
-                else:
-                    folder_name_raw = mapping
-                    content_type = "image,video"
+            folder_name = random.choice(folders)
+            logger.debug(
+                f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}, content_type={content_type}"
+            )
 
-                if force_content_type:
-                    content_type = force_content_type
+            result = await self.get_random_file_from_keyword(keyword, folder_name, content_type)
 
-                # 处理多文件夹随机逻辑
-                folders = [f.strip() for f in folder_name_raw.replace('，', ',').split(',') if f.strip()]
-                if not folders:
-                    return
-
-                folder_name = random.choice(folders)
-                logger.debug(
-                    f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}, content_type={content_type}"
-                )
-
-                result = await self.get_random_file_from_keyword(keyword, folder_name, content_type)
-
-                if isinstance(result, list):
-                    yield event.chain_result(result)
-                else:
-                    yield event.plain_result(result)
+            if isinstance(result, list):
+                yield event.chain_result(result)
+            else:
+                yield event.plain_result(result)
 
     async def terminate(self):
         """插件销毁时的清理工作"""

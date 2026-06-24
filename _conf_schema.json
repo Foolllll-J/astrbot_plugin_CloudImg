@@ -39,7 +39,7 @@
     "keyword_templates": {
         "type": "template_list",
         "description": "关键词映射",
-        "hint": "在后台配置关键词映射。可为多个关键词绑定同一组文件夹。若与指令映射同名，则以指令映射为准。",
+        "hint": "可为多个关键词绑定同一组文件夹。若与指令映射同名，则以指令映射为准。",
         "templates": {
             "mapping_rule": {
                 "name": "映射条目",
