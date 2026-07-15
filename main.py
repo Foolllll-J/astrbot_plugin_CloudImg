@@ -1,17 +1,18 @@
-from astrbot.api.message_components import *
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, StarTools, register
 import asyncio
-import aiohttp
-import os
 import json
+import os
+import random
 import re
 import string
-import random
 from urllib.parse import urlparse
+
+import aiohttp
+
 from astrbot import logger
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Video, Reply as ApiReply
-from astrbot.core.message.components import Image, Plain, Reply
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.message.components import Image, Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent as BaseAstrMessageEvent
 
 
@@ -19,22 +20,31 @@ class CloudImgPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
-        self.base_url = config.get("base_url", "")
+
+        # ── 图床连接 ──
+        server = config.get("server", {})
+        self.base_url = server.get("base_url", "")
         self.upload_api_url = self.base_url
-        self.public_base_url = self._normalize_base_url(config.get("public_base_url", ""))
-        self.upload_admin_only = config.get("upload_admin_only", True)
-        self.auth_code = config.get("auth_code", "")
+        self.public_base_url = self._normalize_base_url(server.get("public_base_url", ""))
+        self.auth_code = server.get("auth_code", "")
         self.random_path_suffix = "/random?form=text"
-        self.show_upload_link = config.get("show_upload_link", True)
-        self.local_random_type = config.get("local_random_type", False)
+
+        # ── 上传设置 ──
+        upload = config.get("upload", {})
+        self.upload_admin_only = upload.get("admin_only", True)
+        self.show_upload_link = upload.get("show_link", True)
+
+        # ── 随机获取设置 ──
+        randomizer = config.get("randomizer", {})
+        self.local_random_type = randomizer.get("local_random_type", False)
         self.keyword_recent_media_limit = self._clamp_config_int(
-            config.get("keyword_recent_media_limit", 0),
+            randomizer.get("dedupe_window", 0),
             min_value=0,
             max_value=None,
             default=0,
         )
         self.keyword_dedupe_retry_limit = self._clamp_config_int(
-            config.get("keyword_dedupe_retry_limit", 2),
+            randomizer.get("dedupe_retry", 2),
             min_value=0,
             max_value=10,
             default=2,
@@ -378,21 +388,37 @@ class CloudImgPlugin(Star):
 
         history = self.keyword_recent_media_ids.get(keyword, [])
         dedupe_enabled = len(history) > 0
-        max_attempts = self.keyword_dedupe_retry_limit + 1 if dedupe_enabled else 1
+        retry_limit = self.keyword_dedupe_retry_limit if dedupe_enabled else 0
 
         best_fallback = None
         best_distance = -1
-        latest_result = None
 
-        for attempt in range(max_attempts):
+        # 首次 fetch
+        result = await self._fetch_random_media_entry(folder_name, content_type)
+        if not isinstance(result, dict):
+            return result
+
+        media_id = result.get("media_id", "")
+        if not dedupe_enabled or not media_id or media_id not in history:
+            await self._remember_keyword_media_id(keyword, media_id)
+            return result["chain"]
+
+        distance = self._history_distance(history, media_id)
+        if distance > best_distance:
+            best_distance = distance
+            best_fallback = result
+
+        # 显式重试循环
+        for retry_count in range(1, retry_limit + 1):
+            logger.debug(
+                f"/{keyword} 命中近期媒体 ID，重试 {retry_count}/{retry_limit}"
+            )
             result = await self._fetch_random_media_entry(folder_name, content_type)
             if not isinstance(result, dict):
                 return result
 
-            latest_result = result
             media_id = result.get("media_id", "")
-
-            if not dedupe_enabled or not media_id or media_id not in history:
+            if not media_id or media_id not in history:
                 await self._remember_keyword_media_id(keyword, media_id)
                 return result["chain"]
 
@@ -401,12 +427,7 @@ class CloudImgPlugin(Star):
                 best_distance = distance
                 best_fallback = result
 
-            if attempt < max_attempts - 1:
-                logger.debug(
-                    f"/{keyword} 命中近期媒体 ID，重试 {attempt + 1}/{self.keyword_dedupe_retry_limit}"
-                )
-
-        selected = best_fallback or latest_result
+        selected = best_fallback or result
         if isinstance(selected, dict):
             selected_id = selected.get("media_id", "")
             await self._remember_keyword_media_id(keyword, selected_id)
@@ -1212,7 +1233,7 @@ class CloudImgPlugin(Star):
             elif content_type.lower() in ['vid', 'video']:
                 final_content_type = "video"
             else:
-                yield event.plain_result(f"内容类型参数错误！可选值: img(图片), vid(视频)")
+                yield event.plain_result("内容类型参数错误！可选值: img(图片), vid(视频)")
                 return
         else:
             final_content_type = "image,video"
