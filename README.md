@@ -60,7 +60,7 @@
     * 范围：`/上传 文件夹 1-5`
     * 指定多个：`/上传 文件夹 1,3,5`
   * 插件会自动过滤合并记录中的文本，仅提取媒体文件
-* **权限说明**: 需要管理员权限（如果配置了 `upload_admin_only`）
+* **权限说明**: 需要管理员权限（如果配置了 `仅管理员可上传`）
 * **并发限制**: 同时最多处理 3 个上传任务，多余任务将排队等待
 
 ### 3. 关键词映射管理
@@ -89,6 +89,7 @@
 ## ❤️ 支持
 
 * [AstrBot 帮助文档](https://astrbot.app)
+* [CloudFlare ImgBed 图床文档](https://cfbed.sanyue.de/)
 * 如果您在使用中遇到错误或有功能建议，欢迎提交 [Issue](https://github.com/Foolllll-J/astrbot_plugin_CloudImg/issues)。
 
 ---

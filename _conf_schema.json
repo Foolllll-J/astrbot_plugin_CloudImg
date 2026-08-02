@@ -18,6 +18,12 @@
                 "hint": "可选。当图床使用内网地址时，在此填写对外可访问的 URL，无需结尾斜杠。",
                 "default": ""
             },
+            "api_token": {
+                "description": "API Token",
+                "type": "string",
+                "hint": "可选，具有上传权限的 API Token。",
+                "default": ""
+            },
             "auth_code": {
                 "description": "认证码",
                 "type": "string",
