@@ -1,25 +1,79 @@
 import asyncio
+import ipaddress
 import json
 import os
 import random
+import re
+import socket
 import string
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import aiohttp
-
+from aiohttp.abc import AbstractResolver
 from astrbot import logger
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Video, Reply as ApiReply
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Reply as ApiReply
+from astrbot.api.message_components import Video
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.platform.astr_message_event import (
     AstrMessageEvent as BaseAstrMessageEvent,
 )
 from astrbot.core.utils.media_utils import MediaResolver
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    session_waiter,
+)
 
 from .helpers.aiocqhttp import AiocqhttpMixin
 from .helpers.telegram import TelegramMixin
 from .helpers.utils import UtilsMixin
+
+
+class _PinnedResolver(AbstractResolver):
+    """Resolve one request's hostname to the addresses already safety-checked."""
+
+    def __init__(self, addresses: list[str]):
+        self._addresses = tuple(addresses)
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = socket.AF_UNSPEC,
+    ) -> list[dict]:
+        resolved = []
+        for address in self._addresses:
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+
+            address_family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+            if family not in (socket.AF_UNSPEC, address_family):
+                continue
+            resolved.append(
+                {
+                    "hostname": host,
+                    "host": address,
+                    "port": port,
+                    "family": address_family,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            )
+        return resolved
+
+    async def close(self) -> None:
+        return None
+
+
+class _SenderSessionFilter(SessionFilter):
+    """Keep confirmation messages bound to the original sender."""
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:sender:{event.get_sender_id()}"
 
 
 class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
@@ -29,19 +83,34 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         # ── 图床连接 ──
         server = config.get("server", {})
-        self.base_url = server.get("base_url", "")
+        # Keep reading the old top-level location for existing configurations.
+        self.verify_ssl = bool(server.get("verify_ssl", config.get("verify_ssl", True)))
+        self.base_url = self._normalize_base_url(server.get("base_url", ""))
         self.upload_api_url = self.base_url
         self.public_base_url = self._normalize_base_url(
             server.get("public_base_url", "")
         )
-        self.auth_code = server.get("auth_code", "")
-        self.api_token = server.get("api_token", "")
+        self.auth_code = str(server.get("auth_code", "") or "").strip()
+        self.api_token = str(server.get("api_token", "") or "").strip()
         self.random_path_suffix = "/random?form=text"
 
         # ── 上传设置 ──
         upload = config.get("upload", {})
         self.upload_admin_only = upload.get("admin_only", True)
         self.show_upload_link = upload.get("show_link", True)
+
+        # ── 管理功能设置 ──
+        manage = config.get("manage", {})
+        self.list_page_size = self._clamp_config_int(
+            manage.get("list_page_size", 10),
+            min_value=5,
+            max_value=50,
+            default=10,
+        )
+        self.url_upload_whitelist = self._normalize_host_whitelist(
+            manage.get("url_upload_whitelist", [])
+        )
+        self.llm_tools_enabled = bool(manage.get("llm_tools_enabled", False))
 
         # ── 随机获取设置 ──
         randomizer = config.get("randomizer", {})
@@ -71,6 +140,25 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         self.refresh_effective_keyword_map()
         self.keyword_recent_media_ids: dict[str, list[str]] = {}
         self.keyword_recent_media_kv_key = "keyword_recent_media_ids"
+
+        if self.llm_tools_enabled:
+            from .tools.manage import (
+                CloudImgDeleteFolderTool,
+                CloudImgDeleteTool,
+                CloudImgGetFileTool,
+                CloudImgListTool,
+                CloudImgStatTool,
+                CloudImgUploadUrlTool,
+            )
+
+            self.context.add_llm_tools(
+                CloudImgListTool(plugin=self),
+                CloudImgStatTool(plugin=self),
+                CloudImgGetFileTool(plugin=self),
+                CloudImgDeleteTool(plugin=self),
+                CloudImgDeleteFolderTool(plugin=self),
+                CloudImgUploadUrlTool(plugin=self),
+            )
 
     # ==================== 配置文件管理 ====================
 
@@ -197,6 +285,537 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         self.effective_keyword_map = effective_map
 
+    def _build_connector(
+        self, resolver: AbstractResolver | None = None
+    ) -> aiohttp.TCPConnector:
+        """Build a connector honoring the plugin SSL verification setting."""
+        return aiohttp.TCPConnector(
+            ssl=self.verify_ssl,
+            resolver=resolver,
+            use_dns_cache=resolver is None,
+        )
+
+    def _auth_headers(self) -> dict[str, str]:
+        token = (self.api_token or "").strip()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    def _require_api_token(self) -> str | None:
+        if (self.api_token or "").strip():
+            return None
+        return "请先在插件配置中填写 API Token（列表/删除必填）。详见 README。"
+
+    def _require_base_url(self) -> str | None:
+        if self.base_url:
+            return None
+        return "请先配置 base_url。"
+
+    async def _api_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        data: aiohttp.FormData | None = None,
+        require_token: bool = True,
+        expect_json: bool = True,
+    ):
+        """Call a CloudFlare ImgBed API and return JSON or a user-facing error."""
+        base_err = self._require_base_url()
+        if base_err:
+            return base_err
+
+        if require_token:
+            token_err = self._require_api_token()
+            if token_err:
+                return token_err
+
+        normalized_path = (path or "").strip()
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        url = f"{self.base_url}{normalized_path}"
+        headers = self._auth_headers() if require_token or self.api_token else {}
+
+        try:
+            async with aiohttp.ClientSession(
+                connector=self._build_connector()
+            ) as session:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    params=params,
+                    data=data,
+                    headers=headers or None,
+                ) as response:
+                    response_text = await response.text()
+                    if response.status != 200:
+                        return self._handle_response_error(
+                            response.status, response_text
+                        )
+
+                    if not expect_json:
+                        return response_text
+
+                    text = (response_text or "").strip()
+                    if not text:
+                        return {}
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        logger.error(f"API 响应不是有效 JSON: path={normalized_path}")
+                        return "操作失败: 图床返回了非 JSON 响应"
+        except Exception as e:
+            logger.error(
+                f"API 请求失败: method={method}, path={normalized_path}, "
+                f"err={type(e).__name__}: {e}"
+            )
+            return "请求失败，请检查网络与 base_url。"
+
+    def resolve_media_display_url(self, path: str) -> str:
+        """Resolve a CloudFlare ImgBed path to an absolute public URL."""
+        value = (path or "").strip()
+        if not value:
+            return ""
+
+        parsed = urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            resolved = self._build_upload_display_url(value)
+        else:
+            if not (self.public_base_url or self.base_url):
+                return ""
+            normalized = value.lstrip("/")
+            relative = (
+                f"/{normalized}"
+                if normalized.startswith("file/")
+                else f"/file/{normalized}"
+            )
+            resolved = self._build_upload_display_url(relative)
+
+        resolved_parsed = urlparse(resolved)
+        if (
+            resolved_parsed.scheme not in {"http", "https"}
+            or not resolved_parsed.netloc
+        ):
+            return ""
+        return resolved
+
+    def guess_media_type(self, path_or_url: str) -> str:
+        value = path_or_url or ""
+        path = (
+            urlparse(value).path.lower()
+            if "://" in value
+            else value.split("?", 1)[0].split("#", 1)[0].lower()
+        )
+        video_exts = (
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",
+            ".wmv",
+            ".flv",
+            ".webm",
+            ".m4v",
+        )
+        image_exts = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
+        if any(path.endswith(ext) for ext in video_exts):
+            return "video"
+        if any(path.endswith(ext) for ext in image_exts):
+            return "image"
+        return "file"
+
+    @staticmethod
+    def _normalize_host_whitelist(value: object) -> list[str]:
+        if isinstance(value, str):
+            candidates = value.replace("，", ",").split(",")
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            candidates = []
+
+        hosts: list[str] = []
+        for item in candidates:
+            text = str(item or "").strip().lower()
+            if not text:
+                continue
+
+            try:
+                if "://" in text:
+                    host = urlparse(text).hostname or ""
+                else:
+                    authority = text.split("/", 1)[0].strip()
+                    ip_candidate = (
+                        authority[2:] if authority.startswith("*.") else authority
+                    )
+                    try:
+                        ipaddress.ip_address(ip_candidate)
+                        host = ip_candidate
+                    except ValueError:
+                        host = urlparse(f"//{authority}").hostname or ""
+            except ValueError:
+                continue
+
+            host = host.lower().strip().rstrip(".")
+            if host.startswith("*."):
+                host = host[2:]
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    @staticmethod
+    def _host_matches_whitelist(host: str, whitelist: list[str]) -> bool:
+        host = (host or "").lower().rstrip(".")
+        if not host:
+            return False
+        return any(
+            host == entry.rstrip(".") or host.endswith(f".{entry.rstrip('.')}")
+            for entry in whitelist
+            if entry
+        )
+
+    def _host_from_url(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if "://" not in text:
+            text = f"https://{text}"
+        return (urlparse(text).hostname or "").lower().rstrip(".")
+
+    def _effective_url_upload_whitelist(self) -> list[str]:
+        """Return the image-bed hosts plus configured additional hosts."""
+        hosts: list[str] = []
+        for base in (self.base_url, self.public_base_url):
+            host = self._host_from_url(base)
+            if host and host not in hosts:
+                hosts.append(host)
+        for host in getattr(self, "url_upload_whitelist", None) or []:
+            normalized = str(host or "").lower().rstrip(".")
+            if normalized and normalized not in hosts:
+                hosts.append(normalized)
+        return hosts
+
+    @staticmethod
+    def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return (
+            not ip.is_global
+            or ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+            or (ip.version == 4 and ip in ipaddress.ip_network("169.254.0.0/16"))
+            or (ip.version == 6 and ip in ipaddress.ip_network("fc00::/7"))
+        )
+
+    @staticmethod
+    def _parse_download_url(url: str):
+        value = (url or "").strip()
+        try:
+            parsed = urlparse(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return None, "url 必须是有效的 http(s) 链接"
+            if parsed.username or parsed.password:
+                return None, "url 不允许包含用户名或密码"
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None, "url 主机名或端口无效"
+
+        if not host:
+            return None, "url 主机名无效"
+        if port is not None and not 1 <= port <= 65535:
+            return None, "url 端口无效"
+        return parsed, None
+
+    def validate_download_url(
+        self, url: str, *, resolve_dns: bool = True
+    ) -> str | None:
+        """Validate an URL before the LLM URL-upload tool downloads it."""
+        parsed, parse_err = self._parse_download_url(url)
+        if parse_err:
+            return parse_err
+
+        host = parsed.hostname or ""
+        host_lower = host.lower().rstrip(".")
+        allowed = self._effective_url_upload_whitelist()
+        if not allowed:
+            return "请先配置 base_url 或 public_base_url，或填写 URL 上传主机白名单"
+        if not self._host_matches_whitelist(host_lower, allowed):
+            return f"主机不在允许列表中：{host_lower}。默认仅允许图床域名，可在 URL 上传白名单中追加"
+
+        if not self.verify_ssl:
+            return None
+
+        try:
+            ip = ipaddress.ip_address(host)
+            if self._is_blocked_ip(ip):
+                return "目标地址是内网或保留地址，已拒绝"
+            return None
+        except ValueError:
+            pass
+
+        if not resolve_dns:
+            return None
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            return "无法解析主机名"
+        if not addrinfos:
+            return "无法解析主机名"
+
+        for info in addrinfos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if self._is_blocked_ip(ip):
+                return "解析到内网或保留地址，已拒绝（开启 SSL 时禁止 DNS 重绑定）"
+        return None
+
+    async def _resolve_download_addresses(
+        self, parsed, *, timeout_sec: float
+    ) -> tuple[list[str] | None, str | None]:
+        host = parsed.hostname or ""
+        try:
+            ip = ipaddress.ip_address(host)
+            if self._is_blocked_ip(ip):
+                return None, "目标地址是内网或保留地址，已拒绝"
+            return [host], None
+        except ValueError:
+            pass
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        dns_timeout = min(max(float(timeout_sec), 1.0), 5.0)
+        try:
+            addrinfos = await asyncio.wait_for(
+                asyncio.to_thread(
+                    socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+                ),
+                timeout=dns_timeout,
+            )
+        except asyncio.TimeoutError:
+            return None, "DNS 解析超时"
+        except OSError:
+            return None, "无法解析主机名"
+
+        addresses: list[str] = []
+        for info in addrinfos or []:
+            try:
+                address = info[4][0]
+                ip = ipaddress.ip_address(address)
+            except (IndexError, TypeError, ValueError):
+                continue
+            if self._is_blocked_ip(ip):
+                return (
+                    None,
+                    "解析到内网或保留地址，已拒绝（开启 SSL 时禁止 DNS 重绑定）",
+                )
+            if address not in addresses:
+                addresses.append(address)
+        if not addresses:
+            return None, "无法解析主机名"
+        return addresses, None
+
+    @staticmethod
+    def _ext_from_content_type(content_type: str | None) -> str | None:
+        if not content_type:
+            return None
+        mapping = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/webp": ".webp",
+            "video/mp4": ".mp4",
+            "video/webm": ".webm",
+            "video/quicktime": ".mov",
+            "video/x-matroska": ".mkv",
+            "video/x-msvideo": ".avi",
+            "video/x-ms-wmv": ".wmv",
+            "video/x-flv": ".flv",
+            "video/x-m4v": ".m4v",
+        }
+        return mapping.get(content_type.split(";", 1)[0].strip().lower())
+
+    async def download_url_for_upload(
+        self,
+        url: str,
+        *,
+        max_bytes: int = 20 * 1024 * 1024,
+        timeout_sec: float = 30.0,
+        max_redirects: int = 5,
+    ) -> tuple[bytes | None, str | None, str | None, str | None]:
+        """Safely download an URL for the LLM upload tool."""
+        current = (url or "").strip()
+        err = self.validate_download_url(current, resolve_dns=False)
+        if err:
+            return None, None, None, err
+
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        try:
+            for _ in range(max_redirects + 1):
+                err = self.validate_download_url(current, resolve_dns=False)
+                if err:
+                    return None, None, None, err
+
+                parsed, parse_err = self._parse_download_url(current)
+                if parse_err or parsed is None:
+                    return None, None, None, parse_err or "url 无效"
+
+                resolver = None
+                if self.verify_ssl:
+                    addresses, resolve_err = await self._resolve_download_addresses(
+                        parsed, timeout_sec=timeout_sec
+                    )
+                    if resolve_err:
+                        return None, None, None, resolve_err
+                    resolver = _PinnedResolver(addresses or [])
+
+                async with aiohttp.ClientSession(
+                    connector=self._build_connector(resolver), timeout=timeout
+                ) as session:
+                    async with session.get(current, allow_redirects=False) as response:
+                        if response.status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("Location")
+                            if not location:
+                                return None, None, None, "下载失败：重定向缺少 Location"
+                            current = urljoin(str(response.url), location)
+                            continue
+                        if response.status != 200:
+                            return None, None, None, f"下载失败：HTTP {response.status}"
+
+                        content_type = (
+                            response.headers.get("Content-Type") or ""
+                        ).strip() or None
+                        content_length = response.headers.get("Content-Length")
+                        if content_length:
+                            try:
+                                if int(content_length) > max_bytes:
+                                    return (
+                                        None,
+                                        None,
+                                        None,
+                                        f"文件过大，超过 {max_bytes} 字节限制",
+                                    )
+                            except ValueError:
+                                pass
+
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > max_bytes:
+                                return (
+                                    None,
+                                    None,
+                                    None,
+                                    f"文件过大，超过 {max_bytes} 字节限制",
+                                )
+                            chunks.append(chunk)
+
+                        data = b"".join(chunks)
+                        if not data:
+                            return None, None, None, "下载失败：响应体为空"
+
+                        url_name = self._guess_filename_from_url(str(response.url), "")
+                        url_ext = (
+                            os.path.splitext(url_name)[1].lower() if url_name else ""
+                        )
+                        known_exts = {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".gif",
+                            ".bmp",
+                            ".webp",
+                            ".mp4",
+                            ".webm",
+                            ".mov",
+                            ".mkv",
+                            ".avi",
+                            ".wmv",
+                            ".flv",
+                            ".m4v",
+                        }
+                        ext = url_ext if url_ext in known_exts else None
+                        ext = ext or self._ext_from_content_type(content_type) or ".bin"
+                        base = (
+                            os.path.splitext(os.path.basename(url_name))[0]
+                            if url_name
+                            else "upload"
+                        )
+                        filename = f"{base or 'upload'}{ext}"
+                        return data, content_type, filename, None
+
+            return None, None, None, "下载失败：重定向次数过多"
+        except asyncio.TimeoutError:
+            return None, None, None, "下载超时"
+        except Exception as e:
+            logger.error(
+                f"安全下载失败: url={self._redact_url_for_log(url)}, "
+                f"err={type(e).__name__}"
+            )
+            return None, None, None, "下载失败，请检查 URL 与网络"
+
+    async def wait_user_confirm(
+        self, event: AstrMessageEvent, *, timeout: int = 60
+    ) -> tuple[bool, str]:
+        """Wait for a confirmation message in the current session."""
+        state = {"confirmed": False, "cancelled": False}
+        if not event.is_admin():
+            return False, "仅管理员可用"
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return False, "无法确认操作者身份，已取消操作。"
+
+        @session_waiter(timeout=timeout, record_history_chains=False)
+        async def _confirm_waiter(
+            controller: SessionController, confirm_event: AstrMessageEvent
+        ):
+            if (
+                not confirm_event.is_admin()
+                or confirm_event.get_sender_id() != sender_id
+            ):
+                return
+
+            text = (getattr(confirm_event, "message_str", None) or "").strip()
+            if not text:
+                for seg in confirm_event.get_messages():
+                    if isinstance(seg, Plain) and getattr(seg, "text", None):
+                        text = str(seg.text).strip()
+                        break
+
+            lower = text.lower()
+            if text in {"确认", "是"} or lower in {"confirm", "y", "yes"}:
+                state["confirmed"] = True
+                controller.stop()
+                return
+            if text in {"取消", "否"} or lower in {"cancel", "n", "no"}:
+                state["cancelled"] = True
+                controller.stop()
+                return
+            await confirm_event.send(
+                confirm_event.plain_result("请回复「确认」继续，或「取消」中止。")
+            )
+
+        try:
+            await _confirm_waiter(event, session_filter=_SenderSessionFilter())
+        except TimeoutError:
+            return False, "确认超时，已取消操作。"
+        except Exception as e:
+            logger.error(f"会话确认失败: {e}")
+            return False, f"确认过程出错: {e}"
+
+        if state["confirmed"]:
+            return True, ""
+        if state["cancelled"]:
+            return False, "已取消操作。"
+        return False, "已取消操作。"
+
     # ==================== 核心功能方法 ====================
 
     async def initialize(self):
@@ -277,7 +896,16 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
     def _build_random_media_chain(self, file_url: str) -> list:
         parsed_path = urlparse(file_url).path.lower()
-        video_exts = (".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm")
+        video_exts = (
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",
+            ".wmv",
+            ".flv",
+            ".webm",
+            ".m4v",
+        )
         if any(parsed_path.endswith(ext) for ext in video_exts):
             return [Video.fromURL(file_url)]
         return [Image.fromURL(file_url)]
@@ -295,16 +923,20 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                 final_content_type = random.choice(types)
                 logger.debug(f"本地随机媒体类型：{final_content_type}")
 
-        api_request_url = (
-            f"{self.base_url}/random?form=text&content={final_content_type}"
-        )
+        params = {
+            "form": "text",
+            "content": final_content_type,
+        }
         if folder_name:
-            api_request_url += f"&dir={folder_name}"
+            params["dir"] = folder_name
 
-        ssl_context = aiohttp.TCPConnector(verify_ssl=False)
-        async with aiohttp.ClientSession(connector=ssl_context) as session:
-            try:
-                async with session.get(api_request_url) as response:
+        try:
+            async with aiohttp.ClientSession(
+                connector=self._build_connector()
+            ) as session:
+                async with session.get(
+                    f"{self.base_url}/random", params=params
+                ) as response:
                     if response.status != 200:
                         response_text = await response.text()
                         return self._handle_response_error(
@@ -323,10 +955,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                         "file_url": file_url,
                         "relative_file_path": relative_file_path,
                     }
-
-            except Exception as e:
-                logger.error(f"请求随机媒体失败: {e}")
-                return "请求失败，请检查网络、base_url 与文件夹名。"
+        except Exception as e:
+            logger.error(f"请求随机媒体失败: {e}")
+            return "请求失败，请检查网络、base_url 与文件夹名。"
 
     async def get_random_file_from_keyword(
         self, keyword: str, folder_name: str = "", content_type: str = "image,video"
@@ -503,7 +1134,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         params["returnFormat"] = "full"  # 使用完整格式
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                connector=self._build_connector()
+            ) as session:
                 async with session.post(
                     upload_url, data=data, params=params, headers=headers
                 ) as response:
@@ -598,6 +1231,218 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             return data, filename, None
         return None, filename, read_err or "无法获取媒体文件数据"
 
+    # ==================== 列表 / 统计 / 删除 API ====================
+
+    async def list_files(
+        self,
+        dir_path: str = "",
+        start: int = 0,
+        count: int | None = None,
+        *,
+        recursive: bool = False,
+        search: str = "",
+        file_type: str = "",
+        sum_only: bool = False,
+    ):
+        """调用 GET /api/manage/list。成功返回 dict，失败返回错误字符串。"""
+        page_size = self.list_page_size if count is None else count
+        params: dict = {
+            "start": start,
+            "count": -1 if sum_only else page_size,
+        }
+        if sum_only:
+            params["sum"] = "true"
+        if dir_path:
+            params["dir"] = dir_path
+        if recursive:
+            params["recursive"] = "true"
+        if search:
+            params["search"] = search
+        if file_type:
+            params["fileType"] = file_type
+
+        result = await self._api_request(
+            "GET", "/api/manage/list", params=params, require_token=True
+        )
+        if isinstance(result, str):
+            return result
+        if not isinstance(result, dict):
+            return "操作失败: 列表响应格式异常"
+        return result
+
+    async def delete_path(self, path: str, *, is_folder: bool = False):
+        """调用 GET /api/manage/delete/{path}。成功返回 dict，失败返回错误字符串。"""
+        normalized = (path or "").strip().lstrip("/")
+        if not normalized:
+            return "请指定要删除的路径。"
+
+        if "\\" in normalized:
+            return "路径不合法：不允许使用反斜杠。"
+        decoded = unquote(normalized)
+        if any(part in {"", ".", ".."} for part in decoded.split("/")):
+            return "路径不合法：不允许使用路径遍历或空路径段。"
+
+        encoded = quote(normalized, safe="/")
+        params = {"folder": "true"} if is_folder else None
+        result = await self._api_request(
+            "GET",
+            f"/api/manage/delete/{encoded}",
+            params=params,
+            require_token=True,
+        )
+        if isinstance(result, str):
+            return result
+        if not isinstance(result, dict):
+            return "操作失败: 删除响应格式异常"
+        return result
+
+    def _format_list_reply(
+        self,
+        data: dict,
+        dir_path: str,
+        page: int,
+        page_size: int,
+        file_type: str = "",
+    ) -> str:
+        display_dir = dir_path.strip() or "/"
+        directories = data.get("directories") or []
+        files = data.get("files") or []
+        total = data.get("totalCount")
+        if total is None:
+            total = data.get("returnedCount", len(files))
+
+        lines = [f"📁 目录: {display_dir}"]
+        if file_type:
+            lines.append(f"类型筛选: {file_type}")
+
+        if directories:
+            dir_names = []
+            for d in directories:
+                name = str(d).strip().rstrip("/")
+                dir_names.append(name.split("/")[-1] if name else str(d))
+            lines.append(f"子目录: {', '.join(dir_names)}")
+        else:
+            lines.append("子目录: （无）")
+
+        returned = len(files) if isinstance(files, list) else 0
+        lines.append(f"文件 (第 {page} 页，共 {total} 个，本页 {returned} 个):")
+        if not files:
+            lines.append("（本页无文件）")
+        else:
+            for i, item in enumerate(files, start=1):
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("src") or str(item)
+                else:
+                    name = str(item)
+                lines.append(f"{i}. {name}")
+
+        try:
+            total_int = int(total)
+        except (TypeError, ValueError):
+            total_int = returned
+        total_pages = (
+            max(1, (total_int + page_size - 1) // page_size) if page_size > 0 else 1
+        )
+        if page < total_pages:
+            if dir_path:
+                next_cmd = f"/imglist {dir_path} {page + 1}"
+            else:
+                next_cmd = f"/imglist {page + 1}"
+            if file_type == "image":
+                next_cmd = f"{next_cmd} img"
+            elif file_type == "video":
+                next_cmd = f"{next_cmd} vid"
+            lines.append(f"下一页: {next_cmd}")
+
+        return "\n".join(lines)
+
+    def _extract_plain_text(self, event: AstrMessageEvent) -> str:
+        """提取消息纯文本（优先 Plain 段）。"""
+        for seg in event.get_messages():
+            if isinstance(seg, Plain) and getattr(seg, "text", None):
+                return str(seg.text).strip()
+        message_str = getattr(event, "message_str", None)
+        if isinstance(message_str, str) and message_str.strip():
+            return message_str.strip()
+        get_msg = getattr(event, "get_message_str", None)
+        if callable(get_msg):
+            try:
+                value = get_msg()
+                if isinstance(value, str):
+                    return value.strip()
+            except Exception:
+                pass
+        return ""
+
+    def _strip_command_prefix(self, text: str, command_names: set[str]) -> str:
+        """去掉唤醒前缀与命令名，返回剩余参数字符串。"""
+        message_text = (text or "").strip()
+        if not message_text:
+            return ""
+
+        try:
+            cfg = self.context.get_config()
+        except Exception:
+            cfg = {}
+        wake_prefixes = cfg.get("wake_prefix", []) if isinstance(cfg, dict) else []
+        if isinstance(wake_prefixes, str):
+            wake_prefixes = [wake_prefixes]
+        for prefix in wake_prefixes:
+            if isinstance(prefix, str) and prefix and message_text.startswith(prefix):
+                message_text = message_text[len(prefix) :].strip()
+                break
+
+        if message_text.startswith("/"):
+            message_text = message_text[1:].strip()
+
+        parts = message_text.split()
+        if not parts:
+            return ""
+
+        first = parts[0].lower()
+        names = {n.lower() for n in command_names}
+        if first in names:
+            return " ".join(parts[1:]).strip()
+        return " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+
+    def _parse_imglist_args(self, args: list[str]) -> tuple[str, int, str]:
+        """解析 /imglist 参数 -> (dir, page, file_type)。"""
+        dir_path = ""
+        page = 1
+        file_type = ""
+
+        type_aliases = {
+            "img": "image",
+            "image": "image",
+            "i": "image",
+            "vid": "video",
+            "video": "video",
+            "v": "video",
+        }
+
+        tokens = [a.strip() for a in args if a and str(a).strip()]
+        if not tokens:
+            return dir_path, page, file_type
+
+        if len(tokens) >= 2 and tokens[-1].lower() in type_aliases:
+            file_type = type_aliases[tokens[-1].lower()]
+            tokens = tokens[:-1]
+
+        if not tokens:
+            return dir_path, page, file_type
+
+        if len(tokens) == 1 and re.fullmatch(r"\d+", tokens[0]):
+            page = max(1, int(tokens[0]))
+            return dir_path, page, file_type
+
+        if len(tokens) >= 2 and re.fullmatch(r"\d+", tokens[-1]):
+            page = max(1, int(tokens[-1]))
+            dir_path = tokens[0] if len(tokens) == 2 else " ".join(tokens[:-1])
+            return dir_path, page, file_type
+
+        dir_path = tokens[0] if len(tokens) == 1 else " ".join(tokens)
+        return dir_path, page, file_type
+
     # ==================== 命令处理方法 ====================
 
     @filter.command("img")
@@ -608,6 +1453,148 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             yield event.chain_result(result)
         else:
             yield event.plain_result(result)
+
+    @filter.command("imglist", alias={"列表"})
+    async def cmd_imglist(self, event: AstrMessageEvent):
+        """列出图床目录文件：/imglist [目录] [页码] [img|vid]"""
+        if not event.is_admin():
+            yield event.plain_result("此指令仅限管理员使用")
+            return
+
+        arg_text = self._strip_command_prefix(
+            self._extract_plain_text(event),
+            {"imglist", "列表"},
+        )
+        args = [p for p in arg_text.split() if p]
+        dir_path, page, file_type = self._parse_imglist_args(args)
+        page_size = self.list_page_size
+        start = (page - 1) * page_size
+
+        result = await self.list_files(
+            dir_path=dir_path,
+            start=start,
+            count=page_size,
+            file_type=file_type,
+        )
+        if isinstance(result, str):
+            yield event.plain_result(result)
+            return
+
+        yield event.plain_result(
+            self._format_list_reply(result, dir_path, page, page_size, file_type)
+        )
+
+    @filter.command("imgstat", alias={"统计"})
+    async def cmd_imgstat(self, event: AstrMessageEvent, folder_name: str = None):
+        """统计目录文件数：/imgstat [目录]"""
+        if not event.is_admin():
+            yield event.plain_result("此指令仅限管理员使用")
+            return
+
+        dir_path = (folder_name or "").strip()
+        if not dir_path:
+            arg_text = self._strip_command_prefix(
+                self._extract_plain_text(event),
+                {"imgstat", "统计"},
+            )
+            dir_path = arg_text.strip()
+
+        result = await self.list_files(dir_path=dir_path, sum_only=True)
+        if isinstance(result, str):
+            yield event.plain_result(result)
+            return
+
+        total = result.get("sum")
+        if total is None:
+            total = result.get("totalCount", "未知")
+        display_dir = dir_path or "/"
+        yield event.plain_result(f"📊 目录: {display_dir}\n文件总数: {total}")
+
+    @filter.command("imgdel", alias={"删除"})
+    async def cmd_imgdel(self, event: AstrMessageEvent):
+        """删除单个文件：/imgdel <文件路径>"""
+        if not event.is_admin():
+            yield event.plain_result("此指令仅限管理员使用")
+            return
+
+        path = self._strip_command_prefix(
+            self._extract_plain_text(event),
+            {"imgdel", "删除"},
+        )
+        if not path:
+            yield event.plain_result(
+                "参数错误！格式：/imgdel <文件路径>\n例如：/imgdel example/image.jpg"
+            )
+            return
+
+        result = await self.delete_path(path, is_folder=False)
+        if isinstance(result, str):
+            yield event.plain_result(result)
+            return
+
+        if result.get("success") is False:
+            err = result.get("error") or result.get("message") or "删除失败"
+            yield event.plain_result(f"删除失败: {err}")
+            return
+
+        file_id = result.get("fileId") or path
+        yield event.plain_result(f"已删除文件: {file_id}")
+
+    @filter.command("imgdelfolder", alias={"删文件夹"})
+    async def cmd_imgdelfolder(self, event: AstrMessageEvent):
+        """递归删除文件夹：/imgdelfolder <目录>（会话二次确认）"""
+        if not event.is_admin():
+            yield event.plain_result("此指令仅限管理员使用")
+            return
+
+        arg_text = self._strip_command_prefix(
+            self._extract_plain_text(event),
+            {"imgdelfolder", "删文件夹"},
+        )
+        path = arg_text.strip()
+        if not path:
+            yield event.plain_result(
+                "参数错误！格式：/imgdelfolder <目录>\n"
+                "将提示二次确认后递归删除目录及其全部内容。"
+            )
+            return
+
+        yield event.plain_result(
+            f"危险操作：将递归删除目录「{path}」及其全部内容。\n"
+            f"请回复「确认」继续，或「取消」中止。（60 秒内有效）"
+        )
+        confirmed, msg = await self.wait_user_confirm(event, timeout=60)
+        if not confirmed:
+            yield event.plain_result(msg or "已取消操作。")
+            event.stop_event()
+            return
+
+        result = await self.delete_path(path, is_folder=True)
+        if isinstance(result, str):
+            yield event.plain_result(result)
+            event.stop_event()
+            return
+
+        if result.get("success") is False:
+            err = result.get("error") or result.get("message") or "删除失败"
+            yield event.plain_result(f"删除文件夹失败: {err}")
+            event.stop_event()
+            return
+
+        deleted = result.get("deleted") or []
+        failed = result.get("failed") or []
+        lines = [
+            f"已删除文件夹: {path}",
+            f"成功: {len(deleted)} 个文件",
+        ]
+        if failed:
+            lines.append(f"失败: {len(failed)} 个")
+            for item in failed[:10]:
+                lines.append(f"- {item}")
+            if len(failed) > 10:
+                lines.append(f"... 另有 {len(failed) - 10} 个失败项")
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
 
     @filter.command("上传", alias={"upload"})
     async def upload_image(

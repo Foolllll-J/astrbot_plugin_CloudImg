@@ -2,7 +2,7 @@
 
 # 🌐 CloudFlare 图床助手
 
-<i>🖼️ 集高效上传与智能随机于一体的图床工具</i>
+<i>🖼️ 集高效上传、智能随机与图床管理于一体的工具</i>
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
@@ -14,7 +14,7 @@
 
 ## ✨ 简介
 
-一款为 [**AstrBot**](https://github.com/AstrBotDevs/AstrBot) 设计的图床插件。它能从 [CloudFlare-ImgBed 图床](https://github.com/MarSeventh/CloudFlare-ImgBed) 获取随机图片/视频，并支持上传图片/视频到图床。还提供关键词映射功能，可自定义指令获取特定文件夹内容。
+一款为 [**AstrBot**](https://github.com/AstrBotDevs/AstrBot) 设计的图床插件。它能从 [CloudFlare-ImgBed 图床](https://github.com/MarSeventh/CloudFlare-ImgBed) 获取随机图片/视频，支持上传图片/视频到图床，并提供列表、统计与删除等管理能力。
 
 ---
 
@@ -25,6 +25,8 @@
 * 🔗 **关键词映射**: 管理员可设置自定义关键词关联到特定文件夹，如 `/二次元` 获取二次元文件夹内容。
 * 🧠 **去重防重复**: 支持记录关键词最近返回的媒体 ID，并在命中时按配置重试，达到上限后回退使用距离最远的历史 ID。
 * 🧰 **灵活内容过滤**: 支持按内容类型筛选（图片、视频或全部）。
+* 📂 **列表与统计**: 管理员可按目录分页浏览文件、查看文件总数。
+* 🗑️ **删除管理**: 管理员可删除单个文件或（需二次确认）递归删除文件夹。
 
 ---
 
@@ -38,7 +40,18 @@
 
 ## ⚙️ 配置说明
 
-首次加载后，请在 AstrBot 后台 -> 插件 页面找到本插件进行设置。所有配置项都有详细的说明和介绍。
+首次加载后，请在 AstrBot 后台 -> 插件 页面找到本插件进行设置。
+
+### 接口令牌
+
+列表、统计、删除依赖图床 **API Token**；上传建议也配置 Token。
+
+1. 打开图床管理界面 → **系统设置** → **安全设置** → **API Token 管理**
+2. 创建 Token，按需勾选权限：
+   * `upload`：上传
+   * `list`：列表 / 统计
+   * `delete`：删除
+3. 将 Token 填入本插件配置项 **API Token**
 
 ---
 
@@ -77,6 +90,35 @@
     * `/<关键词> v` 或 `/<关键词> vid`：仅获取视频
     * `/<关键词> i` 或 `/<关键词> img`：仅获取图片
   * 例如：`/test v`、`/test i`
+
+### 4. 列表与统计（管理员 + API Token）
+
+* **列表**: `/imglist [目录] [页码] [img|vid]`，别名 `/列表`
+  * 类型筛选仅允许写在**最后**，且前面至少还有目录或页码（避免目录名 `video`/`img` 被误解析）
+  * 示例：`/imglist`、`/imglist video`（列目录 video）、`/imglist wallpaper 2`、`/imglist wallpaper 1 img`、`/imglist 1 img`（根目录第 1 页仅图片）
+* **统计**: `/imgstat [目录]`，别名 `/统计`
+  * 示例：`/imgstat`、`/imgstat wallpaper`
+
+### 5. 删除（管理员 + API Token）
+
+* **删除文件**: `/imgdel <文件路径>`，别名 `/删除`
+  * 示例：`/imgdel example/image.jpg`
+* **删除文件夹**: `/imgdelfolder <目录>`，别名 `/删文件夹`
+  * 发送后机器人会提示，请在 60 秒内回复「确认」继续，或「取消」中止
+  * 示例：`/imgdelfolder example/folder`
+
+### 6. 函数工具
+
+开启函数工具后，Bot 可调用图床管理函数工具；这些工具仅管理员可用。列表、统计和删除需要配置接口令牌，链接上传还会受到来源主机白名单限制：
+
+| 工具 | 作用 |
+|------|------|
+| `cloudimg_list` | 分页列出目录/文件 |
+| `cloudimg_stat` | 统计目录文件数 |
+| `cloudimg_get_file` | 将路径解析为完整 URL；发出媒体请用本体 `send_message_to_user`（`image`/`video` + `url`） |
+| `cloudimg_delete` | 删除单个文件 |
+| `cloudimg_delete_folder` | 递归删目录（会话二次确认） |
+| `cloudimg_upload_url` | 从 http(s) URL 下载并上传到指定文件夹 |
 
 ---
 
