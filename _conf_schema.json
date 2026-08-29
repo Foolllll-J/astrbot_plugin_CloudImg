@@ -1,4 +1,10 @@
 {
+    "verify_ssl": {
+        "description": "验证 SSL 证书",
+        "type": "bool",
+        "hint": "默认开启；自签/内网证书请关闭。",
+        "default": true
+    },
     "server": {
         "type": "object",
         "description": "图床连接",
@@ -29,6 +35,12 @@
                 "type": "string",
                 "hint": "可选，上传 API 的认证码。",
                 "default": ""
+            },
+            "api_token": {
+                "description": "API Token",
+                "type": "string",
+                "hint": "列表/删除必填；上传优先于认证码。",
+                "default": ""
             }
         }
     },
@@ -49,6 +61,31 @@
                 "type": "bool",
                 "hint": "开启后上传成功会在消息中显示图片链接。",
                 "default": true
+            }
+        }
+    },
+    "manage": {
+        "type": "object",
+        "description": "管理功能设置",
+        "hint": "控制列表等管理指令的行为。",
+        "default": {},
+        "items": {
+            "list_page_size": {
+                "description": "列表每页条数",
+                "type": "int",
+                "hint": "默认 10。",
+                "slider": {
+                    "min": 5,
+                    "max": 50,
+                    "step": 1
+                },
+                "default": 10
+            },
+            "url_upload_whitelist": {
+                "description": "URL 上传附加白名单",
+                "type": "list",
+                "hint": "默认已含图床域名；此处追加其它允许主机。",
+                "default": []
             }
         }
     },
