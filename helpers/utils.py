@@ -105,7 +105,9 @@ class UtilsMixin:
     async def download_image(self, url: str) -> bytes | None:
         """下载图片并返回字节数据"""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(
+                connector=self._build_connector()
+            ) as session:
                 async with session.get(url) as resp:
                     resp.raise_for_status()
                     return await resp.read()
