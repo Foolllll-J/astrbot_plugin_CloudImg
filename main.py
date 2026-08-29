@@ -20,7 +20,11 @@ from astrbot.core.platform.astr_message_event import (
     AstrMessageEvent as BaseAstrMessageEvent,
 )
 from astrbot.core.utils.media_utils import MediaResolver
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    session_waiter,
+)
 
 from .helpers.aiocqhttp import AiocqhttpMixin
 from .helpers.telegram import TelegramMixin
@@ -65,23 +69,29 @@ class _PinnedResolver(AbstractResolver):
         return None
 
 
+class _SenderSessionFilter(SessionFilter):
+    """Keep confirmation messages bound to the original sender."""
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:sender:{event.get_sender_id()}"
+
+
 class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
 
-        # ── 全局 ──
-        self.verify_ssl = bool(config.get("verify_ssl", True))
-
         # ── 图床连接 ──
         server = config.get("server", {})
+        # Keep reading the old top-level location for existing configurations.
+        self.verify_ssl = bool(server.get("verify_ssl", config.get("verify_ssl", True)))
         self.base_url = self._normalize_base_url(server.get("base_url", ""))
         self.upload_api_url = self.base_url
         self.public_base_url = self._normalize_base_url(
             server.get("public_base_url", "")
         )
-        self.auth_code = server.get("auth_code", "")
-        self.api_token = server.get("api_token", "")
+        self.auth_code = str(server.get("auth_code", "") or "").strip()
+        self.api_token = str(server.get("api_token", "") or "").strip()
         self.random_path_suffix = "/random?form=text"
 
         # ── 上传设置 ──
@@ -100,6 +110,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         self.url_upload_whitelist = self._normalize_host_whitelist(
             manage.get("url_upload_whitelist", [])
         )
+        self.llm_tools_enabled = bool(manage.get("llm_tools_enabled", False))
 
         # ── 随机获取设置 ──
         randomizer = config.get("randomizer", {})
@@ -130,23 +141,24 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         self.keyword_recent_media_ids: dict[str, list[str]] = {}
         self.keyword_recent_media_kv_key = "keyword_recent_media_ids"
 
-        from .tools.manage import (
-            CloudImgDeleteFolderTool,
-            CloudImgDeleteTool,
-            CloudImgGetFileTool,
-            CloudImgListTool,
-            CloudImgStatTool,
-            CloudImgUploadUrlTool,
-        )
+        if self.llm_tools_enabled:
+            from .tools.manage import (
+                CloudImgDeleteFolderTool,
+                CloudImgDeleteTool,
+                CloudImgGetFileTool,
+                CloudImgListTool,
+                CloudImgStatTool,
+                CloudImgUploadUrlTool,
+            )
 
-        self.context.add_llm_tools(
-            CloudImgListTool(plugin=self),
-            CloudImgStatTool(plugin=self),
-            CloudImgGetFileTool(plugin=self),
-            CloudImgDeleteTool(plugin=self),
-            CloudImgDeleteFolderTool(plugin=self),
-            CloudImgUploadUrlTool(plugin=self),
-        )
+            self.context.add_llm_tools(
+                CloudImgListTool(plugin=self),
+                CloudImgStatTool(plugin=self),
+                CloudImgGetFileTool(plugin=self),
+                CloudImgDeleteTool(plugin=self),
+                CloudImgDeleteFolderTool(plugin=self),
+                CloudImgUploadUrlTool(plugin=self),
+            )
 
     # ==================== 配置文件管理 ====================
 
@@ -371,18 +383,38 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             if not (self.public_base_url or self.base_url):
                 return ""
             normalized = value.lstrip("/")
-            relative = f"/{normalized}" if normalized.startswith("file/") else f"/file/{normalized}"
+            relative = (
+                f"/{normalized}"
+                if normalized.startswith("file/")
+                else f"/file/{normalized}"
+            )
             resolved = self._build_upload_display_url(relative)
 
         resolved_parsed = urlparse(resolved)
-        if resolved_parsed.scheme not in {"http", "https"} or not resolved_parsed.netloc:
+        if (
+            resolved_parsed.scheme not in {"http", "https"}
+            or not resolved_parsed.netloc
+        ):
             return ""
         return resolved
 
     def guess_media_type(self, path_or_url: str) -> str:
         value = path_or_url or ""
-        path = urlparse(value).path.lower() if "://" in value else value.lower()
-        video_exts = (".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v")
+        path = (
+            urlparse(value).path.lower()
+            if "://" in value
+            else value.split("?", 1)[0].split("#", 1)[0].lower()
+        )
+        video_exts = (
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",
+            ".wmv",
+            ".flv",
+            ".webm",
+            ".m4v",
+        )
         image_exts = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
         if any(path.endswith(ext) for ext in video_exts):
             return "video"
@@ -410,7 +442,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                     host = urlparse(text).hostname or ""
                 else:
                     authority = text.split("/", 1)[0].strip()
-                    ip_candidate = authority[2:] if authority.startswith("*.") else authority
+                    ip_candidate = (
+                        authority[2:] if authority.startswith("*.") else authority
+                    )
                     try:
                         ipaddress.ip_address(ip_candidate)
                         host = ip_candidate
@@ -461,7 +495,8 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
     @staticmethod
     def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return (
-            ip.is_private
+            not ip.is_global
+            or ip.is_private
             or ip.is_loopback
             or ip.is_link_local
             or ip.is_reserved
@@ -491,7 +526,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             return None, "url 端口无效"
         return parsed, None
 
-    def validate_download_url(self, url: str, *, resolve_dns: bool = True) -> str | None:
+    def validate_download_url(
+        self, url: str, *, resolve_dns: bool = True
+    ) -> str | None:
         """Validate an URL before the LLM URL-upload tool downloads it."""
         parsed, parse_err = self._parse_download_url(url)
         if parse_err:
@@ -552,7 +589,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         dns_timeout = min(max(float(timeout_sec), 1.0), 5.0)
         try:
             addrinfos = await asyncio.wait_for(
-                asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM),
+                asyncio.to_thread(
+                    socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+                ),
                 timeout=dns_timeout,
             )
         except asyncio.TimeoutError:
@@ -568,7 +607,10 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             except (IndexError, TypeError, ValueError):
                 continue
             if self._is_blocked_ip(ip):
-                return None, "解析到内网或保留地址，已拒绝（开启 SSL 时禁止 DNS 重绑定）"
+                return (
+                    None,
+                    "解析到内网或保留地址，已拒绝（开启 SSL 时禁止 DNS 重绑定）",
+                )
             if address not in addresses:
                 addresses.append(address)
         if not addresses:
@@ -644,12 +686,19 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                         if response.status != 200:
                             return None, None, None, f"下载失败：HTTP {response.status}"
 
-                        content_type = (response.headers.get("Content-Type") or "").strip() or None
+                        content_type = (
+                            response.headers.get("Content-Type") or ""
+                        ).strip() or None
                         content_length = response.headers.get("Content-Length")
                         if content_length:
                             try:
                                 if int(content_length) > max_bytes:
-                                    return None, None, None, f"文件过大，超过 {max_bytes} 字节限制"
+                                    return (
+                                        None,
+                                        None,
+                                        None,
+                                        f"文件过大，超过 {max_bytes} 字节限制",
+                                    )
                             except ValueError:
                                 pass
 
@@ -660,7 +709,12 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                                 continue
                             total += len(chunk)
                             if total > max_bytes:
-                                return None, None, None, f"文件过大，超过 {max_bytes} 字节限制"
+                                return (
+                                    None,
+                                    None,
+                                    None,
+                                    f"文件过大，超过 {max_bytes} 字节限制",
+                                )
                             chunks.append(chunk)
 
                         data = b"".join(chunks)
@@ -668,14 +722,32 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                             return None, None, None, "下载失败：响应体为空"
 
                         url_name = self._guess_filename_from_url(str(response.url), "")
-                        url_ext = os.path.splitext(url_name)[1].lower() if url_name else ""
+                        url_ext = (
+                            os.path.splitext(url_name)[1].lower() if url_name else ""
+                        )
                         known_exts = {
-                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
-                            ".mp4", ".webm", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".m4v",
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".gif",
+                            ".bmp",
+                            ".webp",
+                            ".mp4",
+                            ".webm",
+                            ".mov",
+                            ".mkv",
+                            ".avi",
+                            ".wmv",
+                            ".flv",
+                            ".m4v",
                         }
                         ext = url_ext if url_ext in known_exts else None
                         ext = ext or self._ext_from_content_type(content_type) or ".bin"
-                        base = os.path.splitext(os.path.basename(url_name))[0] if url_name else "upload"
+                        base = (
+                            os.path.splitext(os.path.basename(url_name))[0]
+                            if url_name
+                            else "upload"
+                        )
                         filename = f"{base or 'upload'}{ext}"
                         return data, content_type, filename, None
 
@@ -694,11 +766,22 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
     ) -> tuple[bool, str]:
         """Wait for a confirmation message in the current session."""
         state = {"confirmed": False, "cancelled": False}
+        if not event.is_admin():
+            return False, "仅管理员可用"
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return False, "无法确认操作者身份，已取消操作。"
 
         @session_waiter(timeout=timeout, record_history_chains=False)
         async def _confirm_waiter(
             controller: SessionController, confirm_event: AstrMessageEvent
         ):
+            if (
+                not confirm_event.is_admin()
+                or confirm_event.get_sender_id() != sender_id
+            ):
+                return
+
             text = (getattr(confirm_event, "message_str", None) or "").strip()
             if not text:
                 for seg in confirm_event.get_messages():
@@ -720,7 +803,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             )
 
         try:
-            await _confirm_waiter(event)
+            await _confirm_waiter(event, session_filter=_SenderSessionFilter())
         except TimeoutError:
             return False, "确认超时，已取消操作。"
         except Exception as e:
@@ -813,7 +896,16 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
     def _build_random_media_chain(self, file_url: str) -> list:
         parsed_path = urlparse(file_url).path.lower()
-        video_exts = (".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm")
+        video_exts = (
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",
+            ".wmv",
+            ".flv",
+            ".webm",
+            ".m4v",
+        )
         if any(parsed_path.endswith(ext) for ext in video_exts):
             return [Video.fromURL(file_url)]
         return [Image.fromURL(file_url)]
@@ -839,8 +931,12 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             params["dir"] = folder_name
 
         try:
-            async with aiohttp.ClientSession(connector=self._build_connector()) as session:
-                async with session.get(f"{self.base_url}/random", params=params) as response:
+            async with aiohttp.ClientSession(
+                connector=self._build_connector()
+            ) as session:
+                async with session.get(
+                    f"{self.base_url}/random", params=params
+                ) as response:
                     if response.status != 200:
                         response_text = await response.text()
                         return self._handle_response_error(
@@ -1165,7 +1261,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         if file_type:
             params["fileType"] = file_type
 
-        result = await self._api_request("GET", "/api/manage/list", params=params, require_token=True)
+        result = await self._api_request(
+            "GET", "/api/manage/list", params=params, require_token=True
+        )
         if isinstance(result, str):
             return result
         if not isinstance(result, dict):
@@ -1242,7 +1340,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             total_int = int(total)
         except (TypeError, ValueError):
             total_int = returned
-        total_pages = max(1, (total_int + page_size - 1) // page_size) if page_size > 0 else 1
+        total_pages = (
+            max(1, (total_int + page_size - 1) // page_size) if page_size > 0 else 1
+        )
         if page < total_pages:
             if dir_path:
                 next_cmd = f"/imglist {dir_path} {page + 1}"
@@ -1289,7 +1389,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             wake_prefixes = [wake_prefixes]
         for prefix in wake_prefixes:
             if isinstance(prefix, str) and prefix and message_text.startswith(prefix):
-                message_text = message_text[len(prefix):].strip()
+                message_text = message_text[len(prefix) :].strip()
                 break
 
         if message_text.startswith("/"):

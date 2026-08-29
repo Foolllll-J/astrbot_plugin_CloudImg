@@ -217,7 +217,9 @@ class CloudImgGetFileTool(FunctionTool):
 
         url = self.plugin.resolve_media_display_url(raw_path)
         if not url:
-            return _json_err("无法解析为可访问的绝对 URL，请检查 path 与 base_url/public_base_url")
+            return _json_err(
+                "无法解析为可访问的绝对 URL，请检查 path 与 base_url/public_base_url"
+            )
 
         media_type = self.plugin.guess_media_type(raw_path or url)
         hint = (
@@ -239,9 +241,7 @@ class CloudImgGetFileTool(FunctionTool):
 class CloudImgDeleteTool(FunctionTool):
     plugin: Any = None
     name: str = "cloudimg_delete"
-    description: str = (
-        "Delete a single file on CloudFlare ImgBed by path. Admin and API Token required."
-    )
+    description: str = "Delete a single file on CloudFlare ImgBed by path. Admin and API Token required."
     parameters: dict = field(
         default_factory=lambda: {
             "type": "object",
@@ -269,7 +269,9 @@ class CloudImgDeleteTool(FunctionTool):
         if isinstance(result, str):
             return _json_err(result)
         if result.get("success") is False:
-            return _json_err(str(result.get("error") or result.get("message") or "删除失败"))
+            return _json_err(
+                str(result.get("error") or result.get("message") or "删除失败")
+            )
         return _json_ok({"path": result.get("fileId") or raw_path, "deleted": True})
 
 
@@ -321,7 +323,9 @@ class CloudImgDeleteFolderTool(FunctionTool):
         if isinstance(result, str):
             return _json_err(result)
         if result.get("success") is False:
-            return _json_err(str(result.get("error") or result.get("message") or "删除失败"))
+            return _json_err(
+                str(result.get("error") or result.get("message") or "删除失败")
+            )
 
         deleted = result.get("deleted") or []
         failed = result.get("failed") or []
@@ -360,7 +364,9 @@ class CloudImgUploadUrlTool(FunctionTool):
         }
     )
 
-    async def run(self, event: AstrMessageEvent, url: str = "", folder: str = "") -> str:
+    async def run(
+        self, event: AstrMessageEvent, url: str = "", folder: str = ""
+    ) -> str:
         if err := _require_admin(event):
             return err
         if err := _plugin_or_err(self.plugin):
@@ -371,7 +377,12 @@ class CloudImgUploadUrlTool(FunctionTool):
         if not source_url or not folder_name:
             return _json_err("url 与 folder 均为必填")
 
-        data, content_type, filename, dl_err = await self.plugin.download_url_for_upload(
+        (
+            data,
+            content_type,
+            filename,
+            dl_err,
+        ) = await self.plugin.download_url_for_upload(
             source_url,
             max_bytes=20 * 1024 * 1024,
             timeout_sec=30.0,
