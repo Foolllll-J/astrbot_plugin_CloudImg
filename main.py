@@ -140,6 +140,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         self.refresh_effective_keyword_map()
         self.keyword_recent_media_ids: dict[str, list[str]] = {}
         self.keyword_recent_media_kv_key = "keyword_recent_media_ids"
+        self.tag_random_count_cache: dict[
+            tuple[str, str, tuple[str, ...]], int
+        ] = {}
 
         if self.llm_tools_enabled:
             from .tools.manage import (
@@ -163,7 +166,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
     # ==================== 配置文件管理 ====================
 
     def load_keyword_mappings(self):
-        """从文件加载关键词-文件夹映射"""
+        """从文件加载关键词媒体筛选映射。"""
         try:
             if os.path.exists(self.mappings_file):
                 with open(self.mappings_file, "r", encoding="utf-8") as f:
@@ -184,7 +187,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             self.keyword_folder_map = {}
 
     def save_keyword_mappings(self):
-        """保存关键词-文件夹映射到文件"""
+        """保存关键词媒体筛选映射到文件。"""
         try:
             with open(self.mappings_file, "w", encoding="utf-8") as f:
                 json.dump(self.keyword_folder_map, f, ensure_ascii=False, indent=2)
@@ -204,6 +207,33 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                 folders.append(folder)
         return folders
 
+    def _normalize_tag_names(self, tag_value: object) -> list[str]:
+        if isinstance(tag_value, (list, tuple, set)):
+            candidates = tag_value
+        else:
+            candidates = str(tag_value or "").replace("，", ",").split(",")
+
+        tags: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            tag = str(item or "").strip()
+            normalized = tag.casefold()
+            if tag and normalized not in seen:
+                tags.append(tag)
+                seen.add(normalized)
+        return tags
+
+    def _build_tag_random_cache_key(
+        self,
+        folder_name: str,
+        content_type: str,
+        include_tags: list[str],
+    ) -> tuple[str, str, tuple[str, ...]]:
+        normalized_folder = str(folder_name or "").strip().strip("/")
+        normalized_type = self._normalize_content_type(content_type)
+        normalized_tags = tuple(tag.casefold() for tag in include_tags)
+        return normalized_folder, normalized_type, normalized_tags
+
     def _normalize_content_type(self, content_type: object) -> str:
         normalized = str(content_type or "").strip().lower()
         if normalized in {"image", "video", "image,video"}:
@@ -212,16 +242,19 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
     def _build_mapping_entry(
         self,
-        folders: list[str],
+        folders: object,
         content_type: object = "image,video",
+        tags: object = None,
         source: str | None = None,
     ) -> dict | None:
         normalized_folders = self._normalize_folder_names(folders)
-        if not normalized_folders:
+        normalized_tags = self._normalize_tag_names(tags)
+        if not normalized_folders and not normalized_tags:
             return None
 
         mapping = {
             "folder": ",".join(normalized_folders),
+            "tags": normalized_tags,
             "content_type": self._normalize_content_type(content_type),
         }
         if source:
@@ -246,6 +279,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             mapping_entry = self._build_mapping_entry(
                 folders=folders,
                 content_type=item.get("content_type", "image,video"),
+                tags=item.get("tags", item.get("include_tags", [])),
                 source="template",
             )
             if not mapping_entry:
@@ -275,6 +309,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
                 mapping_entry = self._build_mapping_entry(
                     folders=value.get("folder", ""),
                     content_type=value.get("content_type", "image,video"),
+                    tags=value.get("tags", value.get("include_tags", [])),
                     source="runtime",
                 )
             else:
@@ -302,7 +337,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
     def _require_api_token(self) -> str | None:
         if (self.api_token or "").strip():
             return None
-        return "请先在插件配置中填写 API Token（列表/删除必填）。详见 README。"
+        return "请先在插件配置中填写 API Token（列表/标签随机/删除必填）。详见 README。"
 
     def _require_base_url(self) -> str | None:
         if self.base_url:
@@ -910,11 +945,130 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             return [Video.fromURL(file_url)]
         return [Image.fromURL(file_url)]
 
+    def _build_list_media_chain(self, file_url: str, file_item: object) -> list:
+        metadata = file_item.get("metadata", {}) if isinstance(file_item, dict) else {}
+        mime_type = str(
+            metadata.get("File-Mime") or metadata.get("FileType") or ""
+        ).lower()
+        if mime_type.startswith("video/"):
+            return [Video.fromURL(file_url)]
+        if mime_type.startswith("image/"):
+            return [Image.fromURL(file_url)]
+        return self._build_random_media_chain(file_url)
+
+    async def _fetch_tagged_random_media_entry(
+        self,
+        folder_name: str,
+        content_type: str,
+        include_tags: list[str],
+    ):
+        """Use the management list API to randomly select a tagged media file."""
+        cache_key = self._build_tag_random_cache_key(
+            folder_name, content_type, include_tags
+        )
+        cached_total = self.tag_random_count_cache.get(cache_key)
+
+        for _ in range(2):
+            if cached_total is None:
+                count_result = await self.list_files(
+                    dir_path=folder_name,
+                    count=1,
+                    recursive=True,
+                    file_type=content_type,
+                    include_tags=include_tags,
+                    sum_only=True,
+                )
+                if isinstance(count_result, str):
+                    return count_result
+
+                total = count_result.get("sum", count_result.get("totalCount", 0))
+                try:
+                    total = int(total)
+                except (TypeError, ValueError):
+                    return "请求失败：图床返回的标签媒体数量无效。"
+
+                if total <= 0:
+                    tag_text = ", ".join(include_tags)
+                    folder_text = f"目录「{folder_name}」" if folder_name else "图床"
+                    return f"{folder_text}中未找到包含标签「{tag_text}」的媒体。"
+
+                self.tag_random_count_cache[cache_key] = total
+                cached_total = total
+            else:
+                logger.debug(
+                    f"使用标签随机数量缓存：folder={folder_name or '<root>'}, "
+                    f"tags={include_tags}, total={cached_total}"
+                )
+
+            result = await self.list_files(
+                dir_path=folder_name,
+                start=random.randrange(cached_total),
+                count=1,
+                recursive=True,
+                file_type=content_type,
+                include_tags=include_tags,
+            )
+            if isinstance(result, str):
+                return result
+
+            # The ImgBed fallback response does not reapply tag filters. Do not
+            # select from it, otherwise a tagged request could return any file.
+            if result.get("isIndexedResponse") is False:
+                return "标签随机获取失败：图床索引未生效，请先重建图床索引。"
+
+            response_total = result.get("totalCount")
+            try:
+                response_total = int(response_total)
+            except (TypeError, ValueError):
+                response_total = None
+            if response_total is not None:
+                if response_total > 0:
+                    self.tag_random_count_cache[cache_key] = response_total
+                    cached_total = response_total
+                else:
+                    self.tag_random_count_cache.pop(cache_key, None)
+                    cached_total = None
+
+            files = result.get("files") or []
+            if not isinstance(files, list) or not files:
+                self.tag_random_count_cache.pop(cache_key, None)
+                cached_total = None
+                logger.debug("标签随机结果在请求期间发生变化，将重试一次")
+                continue
+
+            file_item = files[0]
+            if isinstance(file_item, dict):
+                relative_file_path = str(
+                    file_item.get("name") or file_item.get("src") or ""
+                ).strip()
+            else:
+                relative_file_path = str(file_item or "").strip()
+            if not relative_file_path:
+                return "请求失败：图床列表未返回媒体路径。"
+
+            file_url = self.resolve_media_display_url(relative_file_path)
+            if not file_url:
+                return "请求失败：无法解析图床媒体 URL，请检查 base_url 或 public_base_url。"
+
+            return {
+                "chain": self._build_list_media_chain(file_url, file_item),
+                "media_id": self._extract_media_id(relative_file_path),
+                "file_url": file_url,
+                "relative_file_path": relative_file_path,
+            }
+
+        return "请求失败：标签随机结果在请求期间发生变化，请稍后重试。"
+
     async def _fetch_random_media_entry(
-        self, folder_name: str = "", content_type: str = "image,video"
+        self,
+        folder_name: str = "",
+        content_type: str = "image,video",
+        include_tags: object = None,
     ):
         if not self.base_url:
             return "请先配置 base_url。"
+
+        normalized_tags = self._normalize_tag_names(include_tags)
 
         final_content_type = content_type
         if self.local_random_type and "," in final_content_type:
@@ -922,6 +1076,13 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             if len(types) > 1:
                 final_content_type = random.choice(types)
                 logger.debug(f"本地随机媒体类型：{final_content_type}")
+
+        if normalized_tags:
+            return await self._fetch_tagged_random_media_entry(
+                folder_name=folder_name,
+                content_type=final_content_type,
+                include_tags=normalized_tags,
+            )
 
         params = {
             "form": "text",
@@ -960,10 +1121,16 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             return "请求失败，请检查网络、base_url 与文件夹名。"
 
     async def get_random_file_from_keyword(
-        self, keyword: str, folder_name: str = "", content_type: str = "image,video"
+        self,
+        keyword: str,
+        folder_name: str = "",
+        content_type: str = "image,video",
+        include_tags: object = None,
     ):
         if self.keyword_recent_media_limit <= 0:
-            result = await self._fetch_random_media_entry(folder_name, content_type)
+            result = await self._fetch_random_media_entry(
+                folder_name, content_type, include_tags
+            )
             if isinstance(result, dict):
                 return result["chain"]
             return result
@@ -976,7 +1143,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         best_distance = -1
 
         # 首次 fetch
-        result = await self._fetch_random_media_entry(folder_name, content_type)
+        result = await self._fetch_random_media_entry(
+            folder_name, content_type, include_tags
+        )
         if not isinstance(result, dict):
             return result
 
@@ -995,7 +1164,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             logger.debug(
                 f"/{keyword} 命中近期媒体 ID，重试 {retry_count}/{retry_limit}"
             )
-            result = await self._fetch_random_media_entry(folder_name, content_type)
+            result = await self._fetch_random_media_entry(
+                folder_name, content_type, include_tags
+            )
             if not isinstance(result, dict):
                 return result
 
@@ -1021,10 +1192,15 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         return "请求失败：未获取到可用媒体。"
 
     async def get_random_file_from_folder(
-        self, folder_name: str = "", content_type: str = "image,video"
+        self,
+        folder_name: str = "",
+        content_type: str = "image,video",
+        include_tags: object = None,
     ):
         """Get one random image/video from the target folder."""
-        result = await self._fetch_random_media_entry(folder_name, content_type)
+        result = await self._fetch_random_media_entry(
+            folder_name, content_type, include_tags
+        )
         if isinstance(result, dict):
             return result["chain"]
         return result
@@ -1242,6 +1418,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         recursive: bool = False,
         search: str = "",
         file_type: str = "",
+        include_tags: object = None,
         sum_only: bool = False,
     ):
         """调用 GET /api/manage/list。成功返回 dict，失败返回错误字符串。"""
@@ -1260,6 +1437,9 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             params["search"] = search
         if file_type:
             params["fileType"] = file_type
+        normalized_tags = self._normalize_tag_names(include_tags)
+        if normalized_tags:
+            params["includeTags"] = ",".join(normalized_tags)
 
         result = await self._api_request(
             "GET", "/api/manage/list", params=params, require_token=True
@@ -1785,13 +1965,21 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             for key, mapping in self.effective_keyword_map.items():
                 if isinstance(mapping, dict):
                     folder = mapping.get("folder", "")
+                    tags = self._normalize_tag_names(mapping.get("tags", []))
                     ctype = mapping.get("content_type", "image,video")
                     source = mapping.get("source", "runtime")
                     source_text = "指令" if source == "runtime" else "模板"
-                    result += f"  /{key} -> {folder} ({ctype}) [{source_text}]\n"
+                    target = folder or "根目录"
+                    if tags:
+                        target += f"，标签: {','.join(tags)}"
+                    result += f"  /{key} -> {target} ({ctype}) [{source_text}]\n"
                 else:
                     result += f"  /{key} -> {mapping}\n"
-            result += "\n使用 /imglink 关键词 文件夹名 [内容类型] 来添加新映射。\n内容类型可选: img(图片), vid(视频), 未指定则为全部"
+            result += (
+                "\n使用 /imglink 关键词 文件夹名 [内容类型] 添加文件夹映射。"
+                "\n使用 /imglinktag 关键词 标签1,标签2 [文件夹] [内容类型] 添加标签映射。"
+                "\n内容类型可选: img(图片), vid(视频), 未指定则为全部"
+            )
             yield event.plain_result(result.strip())
             return
 
@@ -1830,6 +2018,87 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         yield event.plain_result(
             f"已将关键词 '{keyword}' 与文件夹 '{folder_name}' 关联（{desc}），现在发送 /{keyword} 即可获取其中随机一个文件夹的随机{desc}。"
+        )
+
+    @filter.command("imglinktag")
+    async def link_keyword_to_tags(
+        self,
+        event: AstrMessageEvent,
+        keyword: str = None,
+        tags: str = None,
+        folder_or_type: str = None,
+        content_type: str = None,
+    ):
+        """关联关键词和图床标签，可选限制在指定文件夹内。"""
+        if not event.is_admin():
+            yield event.plain_result("此指令仅限管理员使用")
+            return
+
+        if not keyword or not tags:
+            yield event.plain_result(
+                "参数错误！格式：/imglinktag 关键词 标签1,标签2 [文件夹] [内容类型]\n"
+                "例如：/imglinktag anime 二次元,插画\n"
+                "或：/imglinktag wallpaper 风景,壁纸 wallpaper img"
+            )
+            return
+
+        normalized_tags = self._normalize_tag_names(tags)
+        if not normalized_tags:
+            yield event.plain_result("标签不能为空。")
+            return
+
+        folder_name = folder_or_type or ""
+        if content_type is None and folder_name.lower() in {
+            "img",
+            "image",
+            "vid",
+            "video",
+        }:
+            content_type = folder_name
+            folder_name = ""
+
+        if content_type:
+            normalized_content_type = content_type.lower()
+            if normalized_content_type in ["img", "image"]:
+                final_content_type = "image"
+            elif normalized_content_type in ["vid", "video"]:
+                final_content_type = "video"
+            else:
+                yield event.plain_result(
+                    "内容类型参数错误！可选值: img(图片), vid(视频)"
+                )
+                return
+        else:
+            final_content_type = "image,video"
+
+        mapping_entry = self._build_mapping_entry(
+            folders=folder_name,
+            tags=normalized_tags,
+            content_type=final_content_type,
+            source="runtime",
+        )
+        if not mapping_entry:
+            yield event.plain_result("标签映射不能为空。")
+            return
+
+        self.keyword_folder_map[keyword] = {
+            "folder": mapping_entry["folder"],
+            "tags": mapping_entry["tags"],
+            "content_type": mapping_entry["content_type"],
+        }
+        self.save_keyword_mappings()
+        self.refresh_effective_keyword_map()
+
+        content_type_desc = {
+            "image": "图片",
+            "video": "视频",
+            "image,video": "图片或视频",
+        }
+        desc = content_type_desc.get(final_content_type, "图片或视频")
+        scope = f"文件夹 '{folder_name}' 内" if folder_name else "全图床"
+        yield event.plain_result(
+            f"已将关键词 '{keyword}' 关联到标签 '{','.join(normalized_tags)}'（{scope}，{desc}），"
+            f"现在发送 /{keyword} 即可获取符合条件的随机{desc}。"
         )
 
     @filter.command("imgunlink")
@@ -1991,9 +2260,11 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             mapping = self.effective_keyword_map[keyword]
             if isinstance(mapping, dict):
                 folder_name_raw = mapping.get("folder", "")
+                include_tags = self._normalize_tag_names(mapping.get("tags", []))
                 content_type = mapping.get("content_type", "image,video")
             else:
                 folder_name_raw = mapping
+                include_tags = []
                 content_type = "image,video"
 
             if force_content_type:
@@ -2001,19 +2272,20 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
             folders = [
                 f.strip()
-                for f in folder_name_raw.replace("，", ",").split(",")
+                for f in str(folder_name_raw or "").replace("，", ",").split(",")
                 if f.strip()
             ]
-            if not folders:
+            if not folders and not include_tags:
                 return
 
-            folder_name = random.choice(folders)
+            folder_name = random.choice(folders) if folders else ""
             logger.debug(
-                f"动态命令 /{keyword} 触发，从 {folders} 中随机选择文件夹: {folder_name}, content_type={content_type}"
+                f"动态命令 /{keyword} 触发，从 {folders or ['根目录']} 中随机选择文件夹: "
+                f"{folder_name or '根目录'}, tags={include_tags}, content_type={content_type}"
             )
 
             result = await self.get_random_file_from_keyword(
-                keyword, folder_name, content_type
+                keyword, folder_name, content_type, include_tags
             )
 
             if isinstance(result, list):

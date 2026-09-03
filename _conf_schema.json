@@ -27,7 +27,7 @@
             "api_token": {
                 "description": "API Token",
                 "type": "string",
-                "hint": "用于列表、统计和删除；上传时优先使用此令牌，未填写时使用认证码。",
+                "hint": "用于列表、统计、删除和标签随机；上传时优先使用此令牌，未填写时使用认证码。",
                 "default": ""
             },
             "verify_ssl": {
@@ -128,7 +128,7 @@
     "keyword_templates": {
         "type": "template_list",
         "description": "关键词映射",
-        "hint": "可为多个关键词绑定同一组文件夹。若与指令映射同名，则以指令映射为准。",
+        "hint": "可为多个关键词绑定文件夹和/或标签。若与指令映射同名，则以指令映射为准。",
         "templates": {
             "mapping_rule": {
                 "name": "映射条目",
@@ -141,7 +141,13 @@
                     },
                     "folders": {
                         "description": "文件夹列表",
-                        "hint": "可填写多个图床文件夹，触发时随机选择其中一个。",
+                        "hint": "可填写多个图床文件夹，触发时随机选择其中一个；可留空并仅按标签筛选。",
+                        "type": "list",
+                        "default": []
+                    },
+                    "tags": {
+                        "description": "标签列表",
+                        "hint": "可填写多个标签，文件必须同时包含这些标签；填写后使用列表 API 随机获取。",
                         "type": "list",
                         "default": []
                     },

@@ -1,7 +1,7 @@
 name: astrbot_plugin_CloudImg
 display_name: CF 图床助手
-desc: 支持上传图片/视频到 CloudFlare 图床、随机获取、文件管理及函数工具。
-version: v1.5.0
+desc: 支持上传图片/视频到 CloudFlare 图床、按文件夹或标签随机获取、文件管理及函数工具。
+version: v1.6.0
 author: Foolllll
 author_url: https://github.com/Foolllll-J
 repo: https://github.com/Foolllll-J/astrbot_plugin_CloudImg
