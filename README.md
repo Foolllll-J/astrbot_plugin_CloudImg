@@ -98,17 +98,17 @@
 
 ### 4. 列表与统计（管理员 + API Token）
 
-* **列表**: `/imglist [目录] [页码] [img|vid]`，别名 `/列表`
+* **列表**: `/imglist [目录] [页码] [img|vid]`
   * 类型筛选仅允许写在**最后**，且前面至少还有目录或页码（避免目录名 `video`/`img` 被误解析）
   * 示例：`/imglist`、`/imglist video`（列目录 video）、`/imglist wallpaper 2`、`/imglist wallpaper 1 img`、`/imglist 1 img`（根目录第 1 页仅图片）
-* **统计**: `/imgstat [目录]`，别名 `/统计`
+* **统计**: `/imgstat [目录]`
   * 示例：`/imgstat`、`/imgstat wallpaper`
 
 ### 5. 删除（管理员 + API Token）
 
-* **删除文件**: `/imgdel <文件路径>`，别名 `/删除`
+* **删除文件**: `/imgdel <文件路径>`
   * 示例：`/imgdel example/image.jpg`
-* **删除文件夹**: `/imgdelfolder <目录>`，别名 `/删文件夹`
+* **删除文件夹**: `/imgdelfolder <目录>`
   * 发送后机器人会提示，请在 60 秒内回复「确认」继续，或「取消」中止
   * 示例：`/imgdelfolder example/folder`
 

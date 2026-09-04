@@ -1634,7 +1634,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         else:
             yield event.plain_result(result)
 
-    @filter.command("imglist", alias={"列表"})
+    @filter.command("imglist")
     async def cmd_imglist(self, event: AstrMessageEvent):
         """列出图床目录文件：/imglist [目录] [页码] [img|vid]"""
         if not event.is_admin():
@@ -1643,7 +1643,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         arg_text = self._strip_command_prefix(
             self._extract_plain_text(event),
-            {"imglist", "列表"},
+            {"imglist"},
         )
         args = [p for p in arg_text.split() if p]
         dir_path, page, file_type = self._parse_imglist_args(args)
@@ -1664,7 +1664,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
             self._format_list_reply(result, dir_path, page, page_size, file_type)
         )
 
-    @filter.command("imgstat", alias={"统计"})
+    @filter.command("imgstat")
     async def cmd_imgstat(self, event: AstrMessageEvent, folder_name: str = None):
         """统计目录文件数：/imgstat [目录]"""
         if not event.is_admin():
@@ -1675,7 +1675,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         if not dir_path:
             arg_text = self._strip_command_prefix(
                 self._extract_plain_text(event),
-                {"imgstat", "统计"},
+                {"imgstat"},
             )
             dir_path = arg_text.strip()
 
@@ -1690,7 +1690,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         display_dir = dir_path or "/"
         yield event.plain_result(f"📊 目录: {display_dir}\n文件总数: {total}")
 
-    @filter.command("imgdel", alias={"删除"})
+    @filter.command("imgdel")
     async def cmd_imgdel(self, event: AstrMessageEvent):
         """删除单个文件：/imgdel <文件路径>"""
         if not event.is_admin():
@@ -1699,7 +1699,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         path = self._strip_command_prefix(
             self._extract_plain_text(event),
-            {"imgdel", "删除"},
+            {"imgdel"},
         )
         if not path:
             yield event.plain_result(
@@ -1720,7 +1720,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
         file_id = result.get("fileId") or path
         yield event.plain_result(f"已删除文件: {file_id}")
 
-    @filter.command("imgdelfolder", alias={"删文件夹"})
+    @filter.command("imgdelfolder")
     async def cmd_imgdelfolder(self, event: AstrMessageEvent):
         """递归删除文件夹：/imgdelfolder <目录>（会话二次确认）"""
         if not event.is_admin():
@@ -1729,7 +1729,7 @@ class CloudImgPlugin(Star, UtilsMixin, TelegramMixin, AiocqhttpMixin):
 
         arg_text = self._strip_command_prefix(
             self._extract_plain_text(event),
-            {"imgdelfolder", "删文件夹"},
+            {"imgdelfolder"},
         )
         path = arg_text.strip()
         if not path:
